@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>my-deck-widgets — local demo</title>
+<!-- deck.gl provides the global `deck` that the bundle externalises against -->
+<script src="https://unpkg.com/deck.gl@9/dist.min.js"></script>
+<!-- the locally-built bundle: window.myDeckWidgets -->
+<script src="/dist/bundle.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; color: #e6edf3;
+    font-family: ui-monospace, Menlo, monospace; }
+  #deck { position: absolute; inset: 0; }
+  #note { position: absolute; left: 16px; top: 14px; z-index: 2; font-size: 12px; color: #7d8b99; }
+  #note b { color: #34e0c4; }
+  #err { position: absolute; inset: 0; display: none; place-items: center; text-align: center;
+    color: #f0765c; font-size: 13px; padding: 24px; }
+</style>
+</head>
+<body>
+<div id="deck"></div>
+<div id="note"><b>ClusteredLabeledScatterplotLayer</b> — scroll to zoom out and watch dots merge &amp; sum</div>
+<div id="err"></div>
+<script>
+  (function () {
+    const fail = (msg) => { const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'grid'; };
+    if (!window.deck || !deck.Deck) return fail('deck.gl failed to load from the CDN.');
+    if (!window.myDeckWidgets || !myDeckWidgets.ClusteredLabeledScatterplotLayer)
+      return fail('bundle not found — run `npm run build` (or `npm run dev`) and reload.');
+
+    const { Deck, OrthographicView } = deck;
+    const { ClusteredLabeledScatterplotLayer } = myDeckWidgets;
+
+    const palette = [[80,140,240],[240,118,92],[200,120,240],[240,196,80],[96,200,130]];
+    const seeded = (n) => { const x = Math.sin(n * 999.13) * 43758.5453; return x - Math.floor(x); };
+    const data = Array.from({ length: 40 }, (_, i) => {
+      const blob = i % 3;
+      const bx = [-170, 150, -10][blob], by = [90, 40, -120][blob];
+      return {
+        geometry: { coordinates: [bx + (seeded(i+2)-0.5)*220, by + (seeded(i+3)-0.5)*200] },
+        value: Math.round(seeded(i + 7) * 40),
+        radius: 15 + Math.round(seeded(i + 1) * 26),
+        color: palette[i % palette.length]
+      };
+    });
+
+    new Deck({
+      parent: document.getElementById('deck'),
+      views: new OrthographicView(),
+      initialViewState: { target: [0, 0, 0], zoom: -0.6 },
+      controller: true,
+      layers: [
+        new ClusteredLabeledScatterplotLayer({
+          id: 'demo',
+          data,
+          getPosition: (d) => d.geometry.coordinates,
+          getValue: (d) => d.value,
+          getRadius: (d) => d.radius,
+          getFillColor: (d) => d.color,
+          aggregate: true,
+          scaleTextToRadius: true
+        })
+      ]
+    });
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+name: release
+
+# Push a version tag to trigger a release, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # dist/ is gitignored, so the tag you pushed doesn't yet contain the built
+      # bundle. Commit it and move the tag onto that commit so that
+      #   https://cdn.jsdelivr.net/gh/<owner>/<repo>@<tag>/dist/bundle.js
+      # resolves. The "[skip ci]" marker stops the forced tag push from
+      # re-triggering this workflow.
+      - name: Attach built bundle to the tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f dist/bundle.js
+          if git diff --cached --quiet; then
+            echo "dist already up to date — nothing to commit"
+          else
+            git commit -m "build: bundle for ${GITHUB_REF_NAME} [skip ci]"
+            git tag -f "${GITHUB_REF_NAME}"
+            git push --force origin "refs/tags/${GITHUB_REF_NAME}"
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/bundle.js
+          generate_release_notes: true

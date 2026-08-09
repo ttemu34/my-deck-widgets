@@ -1,0 +1,29 @@
+name: publish
+
+# Push a version tag to publish to npm (which jsDelivr then mirrors), e.g.:
+#   npm version patch    # bumps package.json + creates the git tag
+#   git push --follow-tags
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - run: npm ci
+
+      # `prepublishOnly` runs `npm run build`, so dist/bundle.js is fresh in the
+      # published tarball. `files` in package.json controls what gets included.
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
