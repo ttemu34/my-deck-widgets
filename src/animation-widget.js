@@ -1,10 +1,10 @@
 // A deck.gl Widget that plays back a TripsLayer over time: a play/pause button
 // plus a scrub slider, driving `currentTime` via a requestAnimationFrame loop.
 //
-// By default it targets every layer instance whose constructor is TripsLayer
-// (matched by class name, since deck.gl's own geo-layers bundle is loaded as
-// the global `deck` and isn't going through our webpack minifier) — pass
-// `layerIds` to restrict it to specific layer ids instead.
+// By default it targets every layer that looks like a TripsLayer (duck-typed
+// on having both trailLength and currentTime props — see _isTripsLayer;
+// layer.constructor.name isn't reliable since production deck.gl bundles are
+// minified and mangle it) — pass `layerIds` to restrict it to specific ids.
 //
 // Animating means re-deriving each target layer with an updated `currentTime`
 // via `new LayerClass({...layer.props, currentTime})` and calling
@@ -42,6 +42,14 @@ export class AnimationWidget extends Widget {
     this._rafId = null;
     this._lastFrameTs = null;
     this._built = false;
+
+    // deck.gl transforms the exposed `data` prop internally after a layer's
+    // first render pass (observed: TripsLayer's props.data.length reads 0
+    // from the very next tick onward), so re-spreading layer.props on every
+    // frame propagates that emptied value forward. Cache each targeted
+    // layer's pristine data the first time we see it, keyed by layer id, and
+    // always reconstruct from that instead of whatever .props.data currently is.
+    this._pristineData = new Map();
 
     // Head-marker interpolation state, keyed by `${layerId}:${rowIndex}`.
     this._cursors = new Map();
@@ -195,17 +203,32 @@ export class AnimationWidget extends Widget {
       }
 
       const isTripsTarget =
-        layerIds && layerIds.length
-          ? layerIds.includes(layer.id)
-          : layer.constructor && layer.constructor.name === 'TripsLayer';
+        layerIds && layerIds.length ? layerIds.includes(layer.id) : this._isTripsLayer(layer);
       if (!isTripsTarget) return layer;
 
+      if (!this._pristineData.has(layer.id)) {
+        this._pristineData.set(layer.id, layer.props.data);
+      }
+
       const LayerClass = layer.constructor;
-      return new LayerClass({ ...layer.props, currentTime: this._currentTime });
+      return new LayerClass({
+        ...layer.props,
+        data: this._pristineData.get(layer.id),
+        currentTime: this._currentTime
+      });
     });
 
     this.deck.setProps({ layers: nextLayers });
     this._applyRotation();
+  }
+
+  // Duck-type on trailLength/currentTime rather than layer.constructor.name:
+  // production/CDN deck.gl bundles are minified, so the runtime class name is
+  // mangled (e.g. "nh", not "TripsLayer") and a name check silently matches
+  // nothing. trailLength+currentTime together are unique to TripsLayer among
+  // deck.gl's own layers, so this is unaffected by minification either way.
+  _isTripsLayer(layer) {
+    return !!layer.props && 'trailLength' in layer.props && 'currentTime' in layer.props;
   }
 
   _resolveField(row, dottedPath) {
