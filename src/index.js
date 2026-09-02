@@ -3,3 +3,4 @@
 // Add more layers/widgets by exporting them alongside these.
 export { ClusteredLabeledScatterplotLayer } from './clustered-labeled-scatterplot-layer';
 export { SizeLegendWidget } from './size-legend-widget';
+export { AnimationWidget } from './animation-widget';
