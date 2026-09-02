@@ -292,8 +292,23 @@ export class AnimationWidget extends Widget {
   }
 
   _applyHeadLayer(layer) {
+    // layer.props.data is safe to cache-and-reuse the same way the TripsLayer
+    // branch does (see _pristineData above). A ScenegraphLayer's `scenegraph`
+    // is a different animal: it's a *string* (a URL), and deck.gl's async-prop
+    // getter for a still-loading string prop always answers `null` — the raw
+    // URL is only ever visible internally, never through `.props`. Rebuilding
+    // via `new LayerClass({...layer.props, ...})` reads scenegraph through
+    // that getter, so every tick would hand the new instance a fresh `null`
+    // and the glTF fetch would never get a chance to start, let alone finish
+    // — which is exactly why the model never appeared. `layer.clone(...)`
+    // (deck.gl's own API for this) reads the *raw*, not-yet-resolved value
+    // instead, so the fetch on the underlying model is left alone to proceed.
+    if (!this._pristineData.has(layer.id)) {
+      this._pristineData.set(layer.id, layer.props.data);
+    }
+
     const { pathField, timestampField, positionField, headingField, orientationField } = this.props;
-    const data = layer.props.data || [];
+    const data = this._pristineData.get(layer.id) || [];
 
     const nextData = data.map((row, i) => {
       const path = this._resolveField(row, pathField);
@@ -313,8 +328,7 @@ export class AnimationWidget extends Widget {
       };
     });
 
-    const LayerClass = layer.constructor;
-    return new LayerClass({ ...layer.props, data: nextData });
+    return layer.clone({ data: nextData });
   }
 
   _applyRotation() {
