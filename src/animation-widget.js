@@ -269,7 +269,7 @@ export class AnimationWidget extends Widget {
   }
 
   _applyHeadLayer(layer) {
-    const { pathField, timestampField, positionField, headingField } = this.props;
+    const { pathField, timestampField, positionField, headingField, orientationField } = this.props;
     const data = layer.props.data || [];
 
     const nextData = data.map((row, i) => {
@@ -280,7 +280,14 @@ export class AnimationWidget extends Widget {
       const result = this._interpolateRow(path, timestamps, this._currentTime, `${layer.id}:${i}`);
       if (!result) return row;
 
-      return { ...row, [positionField]: result.position, [headingField]: result.heading };
+      return {
+        ...row,
+        [positionField]: result.position,
+        [headingField]: result.heading,
+        // [pitch, yaw, roll] in degrees, for a ScenegraphLayer's getOrientation
+        // (yaw negated so the model's nose faces the direction of travel).
+        [orientationField]: [0, -result.heading, 0]
+      };
     });
 
     const LayerClass = layer.constructor;
@@ -358,6 +365,7 @@ AnimationWidget.defaultProps = {
   timestampField: 'times',
   positionField: 'position',
   headingField: 'heading',
+  orientationField: 'orientation',
   minMoveMeters: 3,
   // Auto-rotate (0 -> disabled). Degrees per second; +clockwise.
   autoRotateSpeed: 0
