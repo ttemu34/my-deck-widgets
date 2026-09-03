@@ -70,11 +70,47 @@ export class AnimationWidget extends Widget {
   }
 
   onAdd() {
+    // Publish this instance on `window` so an external driver (e.g. a headless
+    // Playwright capture script rendering the map to video) can seek/pause it
+    // deterministically from outside deck.gl, instead of only via the on-screen
+    // play/pause button + slider. See renderAt/pause/play/span/durationSec below.
+    window.__tripsAnimWidgets = window.__tripsAnimWidgets || [];
+    window.__tripsAnimWidgets.push(this);
     if (this.props.autoplay) this._start();
   }
 
   onRemove() {
     this._stop();
+    if (window.__tripsAnimWidgets) {
+      const i = window.__tripsAnimWidgets.indexOf(this);
+      if (i >= 0) window.__tripsAnimWidgets.splice(i, 1);
+    }
+  }
+
+  // --- External seek/control API (headless video capture) ---------------------
+  get span() {
+    return this.props.maxTime - this.props.minTime;
+  }
+
+  get durationSec() {
+    return this.props.durationMs / 1000;
+  }
+
+  // Stop autoplay and jump to an exact time, applying the frame synchronously
+  // so a driver can screenshot right after calling this.
+  renderAt(t) {
+    this._stop();
+    this._currentTime = Math.max(this.props.minTime, Math.min(this.props.maxTime, t));
+    this._applyFrame();
+    this._updateUI();
+  }
+
+  pause() {
+    this._stop();
+  }
+
+  play() {
+    if (!this._playing) this._start();
   }
 
   onRenderHTML(rootElement) {
