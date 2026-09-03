@@ -268,8 +268,10 @@ export class AnimationWidget extends Widget {
 
   // Interpolated [lon, lat, z] + held-steady heading/pitch for one row's path
   // at time t, using a monotonic per-row cursor (cacheKey) so repeated forward
-  // playback doesn't rescan the whole path every tick.
-  _interpolateRow(path, timestamps, t, cacheKey) {
+  // playback doesn't rescan the whole path every tick. smoothSamples/minMoveMeters
+  // come from the head LAYER's own props (see _applyHeadLayer), not this widget's,
+  // so different head layers can each have their own smoothing/hold-still behaviour.
+  _interpolateRow(path, timestamps, t, cacheKey, smoothSamples, minMoveMeters) {
     const last = timestamps.length - 1;
     if (last < 0 || path.length !== timestamps.length) return null;
 
@@ -298,10 +300,10 @@ export class AnimationWidget extends Widget {
       (a[2] || 0) + ((b[2] || 0) - (a[2] || 0)) * f
     ];
 
-    const tangent = this._windowedTangent(path, j, last, this.props.smoothSamples);
+    const tangent = this._windowedTangent(path, j, last, smoothSamples);
     let heading = this._headings.get(cacheKey) ?? 0;
     let pitch = 0; // stationary (or below minMoveMeters) -> level out, don't hold a stale tilt
-    if (tangent.heading != null && tangent.distance >= this.props.minMoveMeters) {
+    if (tangent.heading != null && tangent.distance >= minMoveMeters) {
       heading = tangent.heading;
       pitch = tangent.pitch;
       this._headings.set(cacheKey, heading);
@@ -326,10 +328,23 @@ export class AnimationWidget extends Widget {
       this._pristineData.set(layer.id, layer.props.data);
     }
 
-    const {
-      pathField, timestampField, positionField, headingField, orientationField,
-      faceHeading, yawOffset, modelPitch, modelRoll, terrainPitch, terrainPitchScale
-    } = this.props;
+    const { pathField, timestampField, positionField, headingField, orientationField } = this.props;
+
+    // Orientation behaviour comes from the head LAYER's own (static) props, not
+    // this widget's — see ScenegraphLayerStyle's face_heading/yaw_offset/etc in
+    // create_head_marker_layer — so different head layers (species/models) can
+    // each behave differently. Defaults here only cover a layer that predates
+    // these props (e.g. the flat 2D dot, which never reads orientation anyway).
+    const lp = layer.props || {};
+    const faceHeading = lp.faceHeading ?? true;
+    const yawOffset = lp.yawOffset ?? 0;
+    const modelPitch = lp.modelPitch ?? 0;
+    const modelRoll = lp.modelRoll ?? 0;
+    const smoothSamples = lp.smoothSamples ?? 2;
+    const terrainPitch = lp.terrainPitch ?? false;
+    const terrainPitchScale = lp.terrainPitchScale ?? 1;
+    const minMoveMeters = lp.minMoveMeters ?? 3;
+
     const data = this._pristineData.get(layer.id) || [];
 
     const nextData = data.map((row, i) => {
@@ -337,7 +352,9 @@ export class AnimationWidget extends Widget {
       const timestamps = this._resolveField(row, timestampField);
       if (!path || !timestamps || !path.length || !timestamps.length) return row;
 
-      const result = this._interpolateRow(path, timestamps, this._currentTime, `${layer.id}:${i}`);
+      const result = this._interpolateRow(
+        path, timestamps, this._currentTime, `${layer.id}:${i}`, smoothSamples, minMoveMeters
+      );
       if (!result) return row;
 
       // [pitch, yaw, roll] in degrees, for a ScenegraphLayer's getOrientation.
@@ -432,15 +449,9 @@ AnimationWidget.defaultProps = {
   positionField: 'position',
   headingField: 'heading',
   orientationField: 'orientation',
-  minMoveMeters: 3,
-  // Head-model orientation.
-  faceHeading: true,
-  yawOffset: 0,
-  modelPitch: 0,
-  modelRoll: 0,
-  smoothSamples: 2,
-  terrainPitch: false,
-  terrainPitchScale: 1,
+  // Head-model orientation (faceHeading/yawOffset/modelPitch/modelRoll/
+  // smoothSamples/terrainPitch(Scale)/minMoveMeters) is read per-layer, off
+  // each head layer's own props, not from here -- see _applyHeadLayer.
   // Auto-rotate (0 -> disabled). Degrees per second; +clockwise.
   autoRotateSpeed: 0
 };
