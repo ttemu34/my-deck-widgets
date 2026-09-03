@@ -19,10 +19,13 @@
 // - Head markers (headLayerIds): a ScatterplotLayer/ScenegraphLayer whose rows
 //   already carry the same path+timestamps a TripsLayer would (pathField /
 //   timestampField, dotted paths into each row). Each tick we interpolate a
-//   position (and a heading, held steady below minMoveMeters so a stationary
-//   subject doesn't spin in place) and write it back onto positionField /
-//   headingField — the same field names the layer's own getPosition /
-//   getOrientation accessors were pointed at when the layer was created.
+//   position and a heading+slope tangent over a +/-smoothSamples window
+//   (held steady below minMoveMeters so a stationary subject doesn't spin
+//   or tip in place), then write [pitch, yaw, roll] to orientationField —
+//   yaw from faceHeading/yawOffset, pitch from modelPitch (+ the path's own
+//   climb/descent slope when terrainPitch is on), roll from modelRoll — the
+//   same field names the layer's own getPosition/getOrientation accessors
+//   were pointed at when the layer was created.
 // - Auto-rotate (autoRotateSpeed): advances camera bearing each tick via
 //   deck.setProps({viewState}). deck.gl treats supplying viewState at all as
 //   "this app now owns the view", so from that point on user pan/zoom only
@@ -235,10 +238,11 @@ export class AnimationWidget extends Widget {
     return dottedPath.split('.').reduce((acc, key) => (acc == null ? acc : acc[key]), row);
   }
 
-  // Bearing (deg, 0 = north) and ground distance (m) from point a to point b,
-  // both [lon, lat(, z)]. Flat-earth approximation — plenty accurate at the
-  // scale of one interpolation step between consecutive track fixes.
-  _headingAndDistance(a, b) {
+  // Bearing (deg, 0 = north), ground distance (m), and terrain-slope pitch
+  // (deg, + = uphill in the direction of travel, capped at +/-20) from point a
+  // to point b, both [lon, lat(, z)]. Flat-earth approximation for bearing and
+  // distance — plenty accurate at the scale of one smoothing window.
+  _tangent(a, b) {
     const midLatRad = ((a[1] + b[1]) / 2) * (Math.PI / 180);
     const dEastDeg = (b[0] - a[0]) * Math.cos(midLatRad);
     const dNorthDeg = b[1] - a[1];
@@ -246,11 +250,24 @@ export class AnimationWidget extends Widget {
       dEastDeg === 0 && dNorthDeg === 0 ? null : (Math.atan2(dEastDeg, dNorthDeg) * 180) / Math.PI;
     const METERS_PER_DEG = 111320;
     const distance = Math.hypot(dEastDeg, dNorthDeg) * METERS_PER_DEG;
-    return { heading, distance };
+    const dz = (b[2] || 0) - (a[2] || 0);
+    let pitch = distance > 0 ? (Math.atan2(dz, distance) * 180) / Math.PI : 0;
+    const PITCH_CAP = 20;
+    pitch = Math.max(-PITCH_CAP, Math.min(PITCH_CAP, pitch));
+    return { heading, distance, pitch };
   }
 
-  // Interpolated [lon, lat, z] + held-steady heading for one row's path at
-  // time t, using a monotonic per-row cursor (cacheKey) so repeated forward
+  // Same as _tangent, but widened +/- smoothSamples fixes around index j
+  // (clamped to the path's ends) so heading/pitch don't jitter fix-to-fix.
+  // smoothSamples=0 -> identical to a single-segment _tangent(path[j], path[j+1]).
+  _windowedTangent(path, j, last, smoothSamples) {
+    const ia = Math.max(0, j - smoothSamples);
+    const ib = Math.min(last, j + 1 + smoothSamples);
+    return this._tangent(path[ia], path[ib]);
+  }
+
+  // Interpolated [lon, lat, z] + held-steady heading/pitch for one row's path
+  // at time t, using a monotonic per-row cursor (cacheKey) so repeated forward
   // playback doesn't rescan the whole path every tick.
   _interpolateRow(path, timestamps, t, cacheKey) {
     const last = timestamps.length - 1;
@@ -281,14 +298,16 @@ export class AnimationWidget extends Widget {
       (a[2] || 0) + ((b[2] || 0) - (a[2] || 0)) * f
     ];
 
-    const { heading, distance } = this._headingAndDistance(a, b);
-    let finalHeading = this._headings.get(cacheKey) ?? 0;
-    if (heading != null && distance >= this.props.minMoveMeters) {
-      finalHeading = heading;
+    const tangent = this._windowedTangent(path, j, last, this.props.smoothSamples);
+    let heading = this._headings.get(cacheKey) ?? 0;
+    let pitch = 0; // stationary (or below minMoveMeters) -> level out, don't hold a stale tilt
+    if (tangent.heading != null && tangent.distance >= this.props.minMoveMeters) {
+      heading = tangent.heading;
+      pitch = tangent.pitch;
       this._headings.set(cacheKey, heading);
     }
 
-    return { position, heading: finalHeading };
+    return { position, heading, pitch };
   }
 
   _applyHeadLayer(layer) {
@@ -307,7 +326,10 @@ export class AnimationWidget extends Widget {
       this._pristineData.set(layer.id, layer.props.data);
     }
 
-    const { pathField, timestampField, positionField, headingField, orientationField } = this.props;
+    const {
+      pathField, timestampField, positionField, headingField, orientationField,
+      faceHeading, yawOffset, modelPitch, modelRoll, terrainPitch, terrainPitchScale
+    } = this.props;
     const data = this._pristineData.get(layer.id) || [];
 
     const nextData = data.map((row, i) => {
@@ -318,13 +340,20 @@ export class AnimationWidget extends Widget {
       const result = this._interpolateRow(path, timestamps, this._currentTime, `${layer.id}:${i}`);
       if (!result) return row;
 
+      // [pitch, yaw, roll] in degrees, for a ScenegraphLayer's getOrientation.
+      // Yaw is negated so the model's nose faces the direction of travel;
+      // faceHeading=false freezes it at a fixed yawOffset instead of tracking
+      // travel direction. terrainPitch adds the path's climb/descent slope
+      // (already capped at +/-20deg in _tangent) on top of the model's own
+      // constant modelPitch, scaled/flipped by terrainPitchScale.
+      const yaw = faceHeading ? -(result.heading + yawOffset) : -yawOffset;
+      const pitch = modelPitch + (terrainPitch ? result.pitch * terrainPitchScale : 0);
+
       return {
         ...row,
         [positionField]: result.position,
         [headingField]: result.heading,
-        // [pitch, yaw, roll] in degrees, for a ScenegraphLayer's getOrientation
-        // (yaw negated so the model's nose faces the direction of travel).
-        [orientationField]: [0, -result.heading, 0]
+        [orientationField]: [pitch, yaw, modelRoll]
       };
     });
 
@@ -404,6 +433,14 @@ AnimationWidget.defaultProps = {
   headingField: 'heading',
   orientationField: 'orientation',
   minMoveMeters: 3,
+  // Head-model orientation.
+  faceHeading: true,
+  yawOffset: 0,
+  modelPitch: 0,
+  modelRoll: 0,
+  smoothSamples: 2,
+  terrainPitch: false,
+  terrainPitchScale: 1,
   // Auto-rotate (0 -> disabled). Degrees per second; +clockwise.
   autoRotateSpeed: 0
 };
