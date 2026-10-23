@@ -4,3 +4,5 @@
 export { ClusteredLabeledScatterplotLayer } from './clustered-labeled-scatterplot-layer';
 export { SizeLegendWidget } from './size-legend-widget';
 export { AnimationWidget } from './animation-widget';
+export { TimelineAnimationWidget } from './timeline-animation-widget';
+export { CameraPanelWidget } from './camera-panel-widget';
