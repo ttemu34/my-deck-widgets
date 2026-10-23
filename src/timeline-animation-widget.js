@@ -64,6 +64,11 @@ TimelineAnimationWidget.defaultProps = {
   fpsLimit: 60,
   autoRotateSpeed: 0,   // deg/s; 0 = off
   sun: { on: false, night: 0.45, smoothS: 0.3 },
+  // Adaptive speed: quiet stretches (every subject below restKmh, or night) play maxSpeedup x faster.
+  pacing: { adaptive: false, maxSpeedup: 6, restKmh: 0.5, night: false },
+  easeS: 0,              // seconds to ease playback speed changes (interactive only)
+  followSmoothingS: 0,   // seconds for the camera to catch up with a followed marker; 0 = locked on
+  terrainExaggeration: 1,
   controls: { visible: false }  // PlaybackControls, snake_case keys as dumped by pydantic
 };
 
@@ -73,13 +78,26 @@ function createTimeline(deck, props) {
   const T0              = props.t0;
   const CONTROLS        = props.controls;
   const durationSec     = props.durationS;
-  const timePerMs       = maxTime / (durationSec * 1000);  // timeline units per wall-clock ms
   const fpsInterval     = 1000 / props.fpsLimit;
   const autoRotateSpeed = props.autoRotateSpeed;
   const SUN             = props.sun;                     // { on, night, smoothS }: sun lighting at the data time
+  const PACING          = props.pacing || TimelineAnimationWidget.defaultProps.pacing;
+  const EASE_S          = props.easeS || 0;
+  const FOLLOW_S        = props.followSmoothingS || 0;
+  const EXAG            = props.terrainExaggeration || 1;
   const CPU_FILTER_LAYERS = ['HexagonLayer'];            // aggregation layers: filter rows, not on the GPU
+  // The comet's speed colours, slow -> fast (blue, teal, yellow, orange, red).
+  const SPEED_RAMP = [[45, 95, 220], [40, 185, 200], [250, 220, 70], [245, 125, 40], [215, 40, 40]];
+  const DAY_COLOR = [255, 205, 110], NIGHT_COLOR = [85, 110, 235];
+  const RUN_FACTOR = 2.5;   // faster than this many times its typical speed -> the run animation
+  // A headless browser (the video exporter) paints exact frames, so 3D-model animations follow the
+  // playback time there instead of the wall clock.
+  const headless = typeof navigator !== 'undefined' && !!navigator.webdriver;
 
-  let currentTime   = 0;
+  let currentTime   = 0;     // timeline (data) time, seconds since t0
+  let progress      = 0;     // playback position 0..1; equals currentTime / maxTime without adaptive speed
+  let effRate       = 0;     // eased playback rate actually applied (0 at load, so playback eases in)
+  let pausing       = false; // easing down to a stop
   let isPlaying     = true;
   let destroyed     = false;
   let lastFrameTime = 0;
@@ -96,7 +114,11 @@ function createTimeline(deck, props) {
   let TextCtor  = null;      // labels and 'no data' tags
   let LineCtor  = null;      // faint lines across data gaps
   let sunLight  = null;      // DirectionalLight that sunAt() moves with the clock (SUN.on)
+  let shadowSun = null;      // { direction, strength } of the current sun, for 3D-marker shadows
   let following = null;      // { layerId, fi }: the marker the camera follows (click_to_follow)
+  let followCenter = null, followTs = 0, followRaf = 0;   // the eased camera centre while following
+  let deckTimeline = null;   // deck's own Timeline, which drives 3D-model animations
+  let pace = null;           // adaptive-speed table (buildPacing); null -> playback is linear in data time
 
   const needsModel  = LAYER_SPECS.some(function (s) { return s.kind === 'trips' && s.head.kind === 'model'; });
   // ScatterplotLayer draws the dot marker and the pulse ring
@@ -227,6 +249,101 @@ function createTimeline(deck, props) {
     return s[s.length >> 1];
   }
 
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+  // Speed (km/h) over segment j of a prepared track.
+  function segKmh(tr, j) {
+    const a = tr.C[j], b = tr.C[j + 1], dt = tr.T[j + 1] - tr.T[j];
+    if (!(dt > 0)) return NaN;
+    const kx = 111320 * Math.cos(a[1] * Math.PI / 180);
+    return Math.hypot((b[0] - a[0]) * kx, (b[1] - a[1]) * 110540) / dt * 3.6;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pacing: playback progress (0..1) <-> timeline time. Without adaptive speed it's linear. With it,
+  // each moment gets playback time in proportion to a weight: 1 while any subject moves, 1/maxSpeedup
+  // while all rest (or at night), softened so the speed swells rather than jumps. Everything that
+  // depends on playback (pulse phase, turn and sun smoothing, the clock, the exporter's frame times)
+  // goes through these, so the video and the map stay in step.
+  // ---------------------------------------------------------------------------
+  function boxBlur(w, R) {
+    const n = w.length, out = new Float64Array(n);
+    let s = 0;
+    for (let k = -R; k <= R; k++) s += w[Math.max(0, Math.min(n - 1, k))];
+    for (let b = 0; b < n; b++) {
+      out[b] = s / (2 * R + 1);
+      s += w[Math.min(n - 1, b + R + 1)] - w[Math.max(0, b - R)];
+    }
+    return out;
+  }
+
+  function buildPacing() {
+    pace = null;
+    if (!PACING.adaptive || !(maxTime > 0) || !(PACING.maxSpeedup > 1)) return;
+    const N = 2048, bw = maxTime / N, act = new Float64Array(N);
+    let any = false;
+    Object.values(animatedById).forEach(function (a) {
+      if (a.spec.kind !== 'trips') return;
+      (a.state.tracks || []).forEach(function (tr) {
+        if (!tr) return;
+        for (let j = 0; j + 1 < tr.T.length; j++) {
+          if (tr.gap[j] || !(segKmh(tr, j) >= PACING.restKmh)) continue;   // gaps and rest stay quiet
+          const b0 = Math.max(0, Math.floor(tr.T[j] / bw)), b1 = Math.min(N - 1, Math.floor(tr.T[j + 1] / bw));
+          for (let b = b0; b <= b1; b++) act[b] = 1;
+          any = true;
+        }
+      });
+    });
+    if (!any) return;                                     // nothing ever moves: keep linear playback
+    const c = PACING.night && T0 > 1e8 ? dataCenter() : null;
+    if (c) {
+      for (let b = 0; b < N; b++) {
+        if (solarPosition((T0 + (b + 0.5) * bw) * 1000, c[1], c[0]).alt < -6 * DEG) act[b] = 0;
+      }
+    }
+    const q = 1 / PACING.maxSpeedup;
+    const R = Math.max(1, Math.round(N * 0.015));          // ~1.5% of the clip either side
+    const w = boxBlur(boxBlur(Array.from(act, function (x) { return q + (1 - q) * x; }), R), R);
+    const cum = new Float64Array(N + 1);
+    for (let b = 0; b < N; b++) cum[b + 1] = cum[b] + w[b];
+    pace = { N: N, bw: bw, cum: cum, total: cum[N] };
+  }
+
+  function progressAt(t) {
+    if (!pace) return clamp01(t / maxTime);
+    const x = Math.max(0, Math.min(pace.N, t / pace.bw)), b = Math.min(pace.N - 1, Math.floor(x));
+    return (pace.cum[b] + (x - b) * (pace.cum[b + 1] - pace.cum[b])) / pace.total;
+  }
+
+  function timeAt(p) {
+    if (!pace) return clamp01(p) * maxTime;
+    const c = clamp01(p) * pace.total, cum = pace.cum;
+    let lo = 0, hi = pace.N - 1;                          // last bin b with cum[b] <= c
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (cum[mid] <= c) lo = mid; else hi = mid - 1; }
+    const w = cum[lo + 1] - cum[lo];
+    return (lo + (w > 0 ? (c - cum[lo]) / w : 0)) * pace.bw;
+  }
+
+  // Data seconds that play per playback second, at time t.
+  function dataRate(t) {
+    if (!pace) return maxTime / durationSec;
+    const b = Math.max(0, Math.min(pace.N - 1, Math.floor(t / pace.bw)));
+    return pace.total * pace.bw / (durationSec * (pace.cum[b + 1] - pace.cum[b]));
+  }
+
+  // The middle of the animated data (first fix of each track), for the sun and night pacing.
+  function dataCenter() {
+    let n = 0, lon = 0, lat = 0;
+    Object.values(animatedById || {}).forEach(function (a) {
+      (a.state.tracks || []).forEach(function (tr) {
+        if (tr && tr.C.length) { lon += tr.C[0][0]; lat += tr.C[0][1]; n++; }
+      });
+    });
+    if (n) return [lon / n, lat / n];
+    const v = currentView();
+    return v ? [v.longitude || 0, v.latitude || 0] : null;
+  }
+
   // Centripetal Catmull-Rom point between p1 and p2 (u in [0,1]); centripetal so uneven fix
   // spacing never makes the curve loop or overshoot. Distances use cos(lat)-scaled degrees.
   function crPoint(p0, p1, p2, p3, u) {
@@ -245,8 +362,10 @@ function createTimeline(deck, props) {
   // One feature's track as the animator uses it: coordinates C and times T (curved if asked),
   // which segments are gaps, and the typical interval between fixes (for turn smoothing).
   function prepTrack(f, spec, subdiv) {
-    const C0 = f.geometry && f.geometry.coordinates, T0s = f.timestamps;
-    if (!C0 || !T0s || !C0.length) return null;
+    const Craw = f.geometry && f.geometry.coordinates, T0s = f.timestamps;
+    if (!Craw || !T0s || !Craw.length) return null;
+    // Exaggerated terrain: raise the track with it (heights were sampled at true scale).
+    const C0 = EXAG === 1 ? Craw : Craw.map(function (p) { return [p[0], p[1], (p[2] || 0) * EXAG]; });
     const n = T0s.length, dts = [], lens = [];
     for (let j = 0; j + 1 < n; j++) {
       dts.push(T0s[j + 1] - T0s[j]);
@@ -341,7 +460,7 @@ function createTimeline(deck, props) {
       const enough = Math.max(head.minMoveM, 0.5 * tr.medLen);
       // At least TURN_PLAYBACK_S of playback either side too: on fast playback one frame spans
       // several fixes, and a window of a few fixes would still turn the marker on every frame.
-      const playbackFloor = TURN_PLAYBACK_S * spec.turnSmoothing * maxTime / durationSec;
+      const playbackFloor = TURN_PLAYBACK_S * spec.turnSmoothing * dataRate(t);
       let W = Math.max(tr.med * spec.turnSmoothing, playbackFloor, 1e-6), g = null;
       for (let k = 0; k < 4; k++, W *= 2) {
         g = windowHeading(tr, j, t, W);
@@ -369,6 +488,52 @@ function createTimeline(deck, props) {
     const metres = Math.hypot((b[0] - a[0]) * kx, (b[1] - a[1]) * 110540);
     const o = orient(heading(j));
     return { pos: pos, heading: o.heading, pitch: o.pitch, speed: t1 > t0 ? metres / (t1 - t0) * 3.6 : NaN };
+  }
+
+  // How a marker responds to its speed: `move` 0 (resting) .. 1 (moving), `fast` 0 .. 1 above its
+  // typical speed, the dot `scale`, and the 3D model's animation `state`. Smooth in speed, so a
+  // marker never flickers between sizes.
+  function speedLook(speed, st, spec) {
+    if (!spec.speedResponse) return { move: 1, fast: 0, scale: 1, state: 'walk' };
+    const rest = PACING.restKmh, typ = Math.max(st.typKmh || 0, rest * 2, 1e-3);
+    const v = isFinite(speed) ? speed : 0;
+    const move = smoothstep(rest * 0.5, Math.max(rest * 1.5, typ * 0.5), v);
+    const fast = smoothstep(typ * 1.5, typ * 3, v);
+    const state = v >= typ * RUN_FACTOR ? 'run' : move > 0.5 ? 'walk' : 'idle';
+    return { move: move, fast: fast, scale: 0.78 + 0.22 * move + 0.15 * fast, state: state };
+  }
+
+  // Per-vertex comet colours for each trail row: by speed (ramp scaled to the layer's 95th-percentile
+  // moving speed) or by day / night (sun altitude at each fix). null -> the track's own colour.
+  function vertexColors(rows, spec, st) {
+    if (spec.cometColor === 'speed') {
+      const top = Math.max(st.p95Kmh || 0, PACING.restKmh * 4, 1e-3);
+      return rows.map(function (r) {
+        const C = r.geometry.coordinates, T = r.timestamps, out = [];
+        for (let k = 0; k < C.length; k++) {
+          const s = Math.max(0, k - 1), e = Math.min(C.length - 1, s + 1);
+          const dt = T[e] - T[s], kx = 111320 * Math.cos(C[s][1] * Math.PI / 180);
+          const v = dt > 0 ? Math.hypot((C[e][0] - C[s][0]) * kx, (C[e][1] - C[s][1]) * 110540) / dt * 3.6 : 0;
+          out.push(rampColor(SPEED_RAMP, clamp01(v / top)));
+        }
+        return out;
+      });
+    }
+    if (spec.cometColor === 'day_night' && T0 > 1e8) {
+      return rows.map(function (r) {
+        const C = r.geometry.coordinates, T = r.timestamps;
+        return C.map(function (p, k) {
+          const w = smoothstep(-6 * DEG, 4 * DEG, solarPosition((T0 + T[k]) * 1000, p[1], p[0]).alt);
+          return NIGHT_COLOR.map(function (n, i) { return Math.round(n + (DAY_COLOR[i] - n) * w); });
+        });
+      });
+    }
+    return null;
+  }
+
+  function rampColor(stops, u) {
+    const x = u * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), f = x - i;
+    return stops[i].map(function (c, k) { return Math.round(c + (stops[i + 1][k] - c) * f); });
   }
 
   // A feature's track colour, read through the TripsLayer's own getColor (column accessor,
@@ -405,7 +570,9 @@ function createTimeline(deck, props) {
         continue;
       }
       const col = head.color || st.colors[i];
-      const d = { position: r.pos, color: col, heading: r.heading, pitch: r.pitch, fi: i, label: label };
+      const look = speedLook(r.speed, st, spec);
+      const d = { position: r.pos, color: col, heading: r.heading, pitch: r.pitch, fi: i, label: label,
+                  move: look.move, scale: look.scale, state: look.state };
       if (spec.hoverInfo) {
         const name = st.tips[i] || ('Track ' + (i + 1));
         d.__tip = '<b>' + escapeHtml(name) + '</b><br>' + escapeHtml(formatTime(t)) +
@@ -429,25 +596,25 @@ function createTimeline(deck, props) {
     const out = [];
     const heads = st.heads || [];
     if (spec.pulsePeriod && ScatterCtor && spec.head.kind !== 'none' && heads.length) {
-      const playbackS = t / maxTime * durationSec;
+      const playbackS = progressAt(t) * durationSec;
       const phase = (playbackS / spec.pulsePeriod) % 1;
+      const r0 = markerRadiusPx(spec.head), grow = 1.1 + 1.9 * phase, alpha = 0.85 * (1 - phase) * 255;
       out.push(new ScatterCtor({
         id: base.id + '-pulse',
         data: heads,
         getPosition: function (d) { return d.position; },
-        getRadius: markerRadiusPx(spec.head),
+        getRadius: function (d) { return r0 * d.scale * grow; },
         radiusUnits: 'pixels',
-        radiusScale: 1.1 + 1.9 * phase,
         filled: false,
         stroked: true,
-        getLineColor: function (d) { return d.color; },
+        // A resting subject stops pulsing (speed response); the ring fades as it grows.
+        getLineColor: function (d) { return [d.color[0], d.color[1], d.color[2], Math.round(alpha * d.move)]; },
         getLineWidth: 2,
         lineWidthUnits: 'pixels',
-        opacity: 0.85 * (1 - phase),
         billboard: true,
         pickable: false,
         parameters: { depthTest: false },
-        updateTriggers: { getPosition: t, getLineColor: 'head' },
+        updateTriggers: { getPosition: t, getRadius: t, getLineColor: t },
       }));
     }
     if (LineCtor && st.gapLines.length) {
@@ -497,52 +664,115 @@ function createTimeline(deck, props) {
     return out;
   }
 
-  function headLayer(base, st, spec, t) {
+  // Soft shadow under 3D models: two dark discs on the ground, pushed away from the sun and fainter
+  // when it's low or down. Sized like the model, within its own pixel limits.
+  function shadowLayers(base, spec, heads) {
+    const m = spec.head.model, r = m.size * 0.3;          // metres
+    let ox = 0, oy = 0, a = 1;
+    if (shadowSun) {
+      const d = shadowSun.direction, k = Math.min(1.5, 0.6 / Math.max(0.3, Math.abs(d[2])));
+      ox = d[0] * r * k; oy = d[1] * r * k;
+      a = 0.25 + 0.75 * clamp01(shadowSun.strength);
+    }
+    function at(d) {
+      const p = d.position, kx = 111320 * Math.cos(p[1] * Math.PI / 180);
+      return [p[0] + ox / kx, p[1] + oy / 110540, p[2] || 0];
+    }
+    const maxPx = m.maxPx == null ? 400 : m.maxPx;
+    const t = currentTime;
+    return [[1, 38], [0.55, 52]].map(function (ring, i) {
+      return new ScatterCtor({
+        id: base.id + '-shadow-' + i,
+        data: heads,
+        getPosition: at,
+        getRadius: r * ring[0],
+        radiusUnits: 'meters',
+        radiusMinPixels: m.minPx * 0.35 * ring[0],
+        radiusMaxPixels: maxPx * 0.35 * ring[0],
+        getFillColor: [0, 0, 0, Math.round(ring[1] * a)],
+        stroked: false,
+        pickable: false,
+        parameters: { depthTest: false },
+        updateTriggers: { getPosition: t },
+      });
+    });
+  }
+
+  // The `_animations` prop for one animation state, cached so deck only re-applies it on a change.
+  // Interactively the walk cycle runs on deck's own clock at the playback speed and stops on pause;
+  // in the headless exporter deck's clock is set to the playback time instead (renderAt).
+  function animationsProp(st, key, speed) {
+    if (key == null) return undefined;
+    const playing = headless || (isPlaying && !pausing);
+    const rate = headless ? speed : speed * playbackRate;
+    const id = key + '|' + playing + '|' + rate;
+    if (!st.anims[id]) {
+      // Every clip defaults to playing, so stop them all ('*' is applied first: keys go in sorted order)
+      // and run only this one.
+      const o = { '*': { playing: false } };
+      o[key] = { playing: playing, speed: rate };
+      st.anims[id] = o;
+    }
+    return st.anims[id];
+  }
+
+  function headLayers(base, st, spec, t) {
     const head = spec.head;
     const interactive = spec.hoverInfo || spec.clickToFollow;
     const onClick = spec.clickToFollow
       ? function (info) { if (info && info.object) { startFollow(base.id, info.object.fi); return true; } return false; }
       : null;
     if (head.kind === 'model' && ScenegraphCtor) {
-      const m = head.model;
-      return new ScenegraphCtor({
-        id: base.id + '-head',
-        data: headData(base, st, spec, t),
-        scenegraph: m.uri,
-        getPosition: function (d) { return d.position; },
-        getOrientation: function (d) {
-          const yaw = (m.faceHeading ? -d.heading : 0) + m.yawOffset;
-          const pitch = m.pitch + (m.terrainPitch ? m.terrainScale * d.pitch : 0);
-          return [pitch, yaw, m.roll];   // [pitch, yaw, roll] degrees
-        },
-        getColor: function (d) {
-          return (m.useTrackColor && d.color) ? d.color : (m.tint || [255, 255, 255]);
-        },
-        sizeScale: m.size,
-        sizeMinPixels: m.minPx,
-        sizeMaxPixels: (m.maxPx == null) ? Number.MAX_SAFE_INTEGER : m.maxPx,
-        _lighting: m.lighting,
-        pickable: interactive,
-        onClick: onClick,
-        parameters: { depthTest: true },
-        updateTriggers: { getPosition: t, getOrientation: t, getColor: 'head' },
+      const m = head.model, heads = headData(base, st, spec, t), out = [];
+      if (spec.shadow && ScatterCtor && heads.length) out.push.apply(out, shadowLayers(base, spec, heads));
+      const anims = m.anims || {};
+      const animated = spec.speedResponse && (anims.walk != null || anims.idle != null);
+      // One layer per animation state (each plays its own clip); without animations, one layer.
+      const groups = animated ? ['idle', 'walk', 'run'] : ['all'];
+      groups.forEach(function (g) {
+        out.push(new ScenegraphCtor({
+          id: base.id + '-head' + (g === 'all' ? '' : '-' + g),
+          data: g === 'all' ? heads : heads.filter(function (d) { return d.state === g; }),
+          scenegraph: m.uri,
+          getPosition: function (d) { return d.position; },
+          getOrientation: function (d) {
+            const yaw = (m.faceHeading ? -d.heading : 0) + m.yawOffset;
+            const pitch = m.pitch + (m.terrainPitch ? m.terrainScale * d.pitch : 0);
+            return [pitch, yaw, m.roll];   // [pitch, yaw, roll] degrees
+          },
+          getColor: function (d) {
+            return (m.useTrackColor && d.color) ? d.color : (m.tint || [255, 255, 255]);
+          },
+          sizeScale: m.size,
+          sizeMinPixels: m.minPx,
+          sizeMaxPixels: (m.maxPx == null) ? Number.MAX_SAFE_INTEGER : m.maxPx,
+          _lighting: m.lighting,
+          _animations: g === 'all' ? undefined : animationsProp(st, anims[g], anims.speed || 1),
+          pickable: interactive,
+          onClick: onClick,
+          parameters: { depthTest: true },
+          updateTriggers: { getPosition: t, getOrientation: t, getColor: 'head' },
+        }));
       });
+      return out;
     }
     if (head.kind !== 'none' && ScatterCtor) {   // dot, or fallback while/if the model can't load
-      return new ScatterCtor(Object.assign({}, head.dot, {
+      const r0 = head.dot.getRadius;
+      return [new ScatterCtor(Object.assign({}, head.dot, {
         id: base.id + '-head',
         data: headData(base, st, spec, t),
         getPosition: function (d) { return d.position; },
+        getRadius: function (d) { return r0 * d.scale; },   // smaller at rest, a little bigger when fast
         getFillColor: function (d) { return d.color; },
         billboard: true,
         pickable: interactive,
         onClick: onClick,
         parameters: { depthTest: false },  // always visible over the terrain
-        updateTriggers: { getPosition: t, getFillColor: 'head' },
-      }));
+        updateTriggers: { getPosition: t, getRadius: t, getFillColor: 'head' },
+      }))];
     }
     headData(base, st, spec, t);   // no marker drawn, but labels, gap tags and follow still need positions
-    return null;
+    return [];
   }
 
   // Time of one row of a time-window layer; GeoJsonLayer rows may nest it under properties.
@@ -575,21 +805,42 @@ function createTimeline(deck, props) {
                                    color: spec.showHistory ? spec.historyColor : colors[i] });
           });
         });
-        return {
+        // Speeds while moving, for the speed response (typical) and the speed colours (95th percentile).
+        const moving = [];
+        tracks.forEach(function (tr) {
+          if (!tr) return;
+          for (let j = 0; j + 1 < tr.T.length; j++) {
+            const v = segKmh(tr, j);
+            if (!tr.gap[j] && v >= PACING.restKmh) moving.push(v);
+          }
+        });
+        moving.sort(function (a, b) { return a - b; });
+        const st = {
           cursors: new Array(n).fill(0), lastHeading: new Array(n).fill(0),
           tracks: tracks, colors: colors, labels: col(spec.labelCol), tips: col(spec.tipCol),
           trailData: trailRows(feats, tracks, spec), gapLines: gapLines, heads: [], gapNow: [],
+          typKmh: moving.length ? moving[moving.length >> 1] : 0,
+          p95Kmh: moving.length ? moving[Math.floor(moving.length * 0.95)] : 0,
+          anims: {},
         };
+        st.vertexColors = vertexColors(st.trailData, spec, st);
+        return st;
       },
       build: function (base, spec, st, t) {
         const layers = [];
         const data = st.trailData;   // split at gaps / curved; the same array every frame
+        // Speed or day/night colours: one colour per vertex, for the comet and its glow.
+        const colorProps = st.vertexColors
+          ? { getColor: function (d, info) { return st.vertexColors[info.index]; },
+              updateTriggers: { getColor: spec.cometColor } }
+          : {};
         if (spec.showHistory) {
-          // Inherit the comet's width from the TripsLayer (do NOT override getWidth).
+          // Inherit the comet's width from the TripsLayer (do NOT override getWidth). The history ends
+          // historyLag of a comet behind the head, so the comet's bright tail fades into it.
           layers.push(base.clone({
             id: base.id + '-history',
             data: data,
-            currentTime: t,
+            currentTime: t - (spec.historyLag || 0) * spec.cometTrail,
             trailLength: spec.historyTrail,
             fadeTrail: spec.fadeHistory,
             opacity: spec.historyOpacity,
@@ -599,7 +850,7 @@ function createTimeline(deck, props) {
         }
         if (spec.glow) {   // the comet again, wider and faint, underneath it
           const p = base.props, k = spec.glow.width;
-          layers.push(base.clone({
+          layers.push(base.clone(Object.assign({
             id: base.id + '-glow',
             data: data,
             currentTime: t,
@@ -610,22 +861,22 @@ function createTimeline(deck, props) {
             widthMinPixels: (p.widthMinPixels || 0) * k,
             widthMaxPixels: (p.widthMaxPixels == null ? Number.MAX_SAFE_INTEGER : p.widthMaxPixels * k),
             pickable: false,
-          }));
+          }, colorProps)));
         }
-        layers.push(base.clone({
+        layers.push(base.clone(Object.assign({
           id: base.id + '-comet',
           data: data,
           currentTime: t,
           trailLength: spec.cometTrail,
           fadeTrail: true,
           opacity: 0.98,
-        }));
-        const head = headLayer(base, st, spec, t);
+        }, colorProps)));
+        const heads = headLayers(base, st, spec, t);
         const decor = decorLayers(base, st, spec, t);
         // pulse under the marker; labels and gap tags over it
         const pulse = decor.filter(function (l) { return /-pulse$/.test(l.id); });
         const rest = decor.filter(function (l) { return !/-pulse$/.test(l.id); });
-        return { layers: layers, overlay: pulse.concat(head ? [head] : [], rest) };
+        return { layers: layers, overlay: pulse.concat(heads, rest) };
       },
     },
 
@@ -714,7 +965,7 @@ function createTimeline(deck, props) {
   // day and night swell gently on fast playback instead of flashing. The averaged light vector gives
   // flat ground exactly the average of the instantaneous lighting. Depends only on t (video = browser).
   function sunAt(t) {
-    const half = SUN.smoothS * maxTime / durationSec;          // data seconds either side
+    const half = SUN.smoothS * dataRate(t);                    // data seconds either side
     const K = half > 0 ? 24 : 1;
     let vx = 0, vy = 0, vz = 0, sky = 0;
     for (let k = 0; k < K; k++) {
@@ -746,7 +997,7 @@ function createTimeline(deck, props) {
 
   function updateSun() {
     if (!sunLight) return;
-    const secondsPerDay = 86400 * durationSec / maxTime;
+    const secondsPerDay = 86400 / dataRate(currentTime);
     const v = smoothstep(DAY_VISIBLE_S[0], DAY_VISIBLE_S[1], secondsPerDay);
     const s = v > 0 ? sunAt(currentTime) : DAYLIGHT;
     function mix(a, b) { return a * v + b * (1 - v); }
@@ -757,6 +1008,7 @@ function createTimeline(deck, props) {
     sunLight.color = s.color.map(function (c, i) { return Math.round(mix(c, DAYLIGHT.color[i])); });
     sunLight.intensity = mix(s.strength, 1) * Math.max(0, DAY_LEVEL - night - SKY) / MAT_DIFFUSE;
     ambientLight.intensity = (night + SKY * mix(s.sky, 1)) / MAT_AMBIENT;
+    shadowSun = { direction: sunLight.direction, strength: mix(s.strength, 1) };
   }
 
   function setupSun() {
@@ -768,14 +1020,7 @@ function createTimeline(deck, props) {
       return;
     }
     // The sun is placed over the middle of the data, not the camera, so a moving camera never changes it.
-    let n = 0, lon = 0, lat = 0;
-    Object.values(animatedById).forEach(function (a) {
-      (a.state.tracks || []).forEach(function (tr) {
-        if (tr && tr.C.length) { lon += tr.C[0][0]; lat += tr.C[0][1]; n++; }
-      });
-    });
-    const v = currentView() || {};
-    sunCenter = n ? [lon / n, lat / n] : [v.longitude || 0, v.latitude || 0];
+    sunCenter = dataCenter() || [0, 0];
     sunLight = new Directional({ color: [255, 250, 240], intensity: 1, direction: [0, 0, -1] });
     ambientLight = new Ambient({ color: [255, 255, 255], intensity: 1 });
     updateSun();
@@ -795,11 +1040,17 @@ function createTimeline(deck, props) {
 
   function startFollow(layerId, fi) {
     following = { layerId: layerId, fi: fi };
+    const v = _deckViewState || currentView();
+    followCenter = v ? [v.longitude, v.latitude] : null;   // glide from here to the marker
+    followTs = performance.now();
     followView();
   }
 
-  function stopFollow() { following = null; }
+  function stopFollow() { following = null; followCenter = null; }
 
+  // Keep the followed marker centred. With FOLLOW_S the camera eases towards it (an exponential
+  // approach that covers ~95% of the way in FOLLOW_S), so it trails the marker slightly and settles
+  // softly instead of jumping with every fix.
   function followView() {
     if (!following || window.__camPreviewOn || !animatedById) return;
     const a = animatedById[following.layerId];
@@ -807,9 +1058,24 @@ function createTimeline(deck, props) {
     if (!h) return;                                  // inside a data gap: hold the camera
     const v = _deckViewState || currentView();
     if (!v) return;
-    _deckViewState = Object.assign({}, v, { longitude: h.position[0], latitude: h.position[1] });
+    const now = performance.now();
+    let lon = h.position[0], lat = h.position[1];
+    if (FOLLOW_S > 0 && followCenter) {
+      const k = 1 - Math.exp(-Math.max(0, now - followTs) / (FOLLOW_S * 1000 / 3));
+      lon = followCenter[0] + (lon - followCenter[0]) * k;
+      lat = followCenter[1] + (lat - followCenter[1]) * k;
+    }
+    followTs = now;
+    followCenter = [lon, lat];
+    _deckViewState = Object.assign({}, v, { longitude: lon, latitude: lat });
     if (autoRotateSpeed === 0) deck.setProps({ viewState: _deckViewState });
-    // with auto-rotation on, frame() applies _deckViewState together with the bearing
+    else if (!isPlaying) deck.setProps({ viewState: Object.assign({}, _deckViewState, { bearing: rotateBearing }) });
+    // while playing with auto-rotation, frame() applies _deckViewState together with the bearing
+    // Paused, nothing redraws, so keep gliding until the camera reaches the marker.
+    const far = Math.abs(lon - h.position[0]) + Math.abs(lat - h.position[1]) > 1e-7;
+    if (far && !isPlaying && !followRaf) {
+      followRaf = requestAnimationFrame(function () { followRaf = 0; followView(); });
+    }
   }
 
   // Hand the camera back to the viewer at `view`, e.g. when the Camera panel's preview ends.
@@ -829,7 +1095,7 @@ function createTimeline(deck, props) {
   // ---------------------------------------------------------------------------
   let controls = null;   // { root, play, slider, label, clock, speed }
   const SPEEDS = CONTROLS.speeds;
-  let playbackRate = 1;  // viewer's speed multiplier on top of durationSec (not used by the exporter)
+  let playbackRate = 1;  // viewer's speed multiplier on top of durationSec (not used by the exporter); effRate eases to it
 
   function formatClock(sec) {
     const s = Math.max(0, Math.round(sec));
@@ -850,24 +1116,42 @@ function createTimeline(deck, props) {
     return h >= 48 ? (h / 24).toFixed(1) + ' d' : h.toFixed(1) + ' h';
   }
 
-  function setPlaying(on) {
-    if (on && currentTime >= maxTime) currentTime = 0;   // play at the end -> start over
-    if (on && !isPlaying) { isPlaying = true; lastTickTs = null; requestAnimationFrame(frame); }
-    if (!on) isPlaying = false;
+  // Play / pause. A pause eases the speed down to a stop over EASE_S (interactive); `hard` stops at
+  // once (the end of the clip, the exporter).
+  function setPlaying(on, hard) {
+    if (on) {
+      if (progress >= 1) { progress = 0; currentTime = 0; effRate = 0; }   // play at the end -> start over
+      pausing = false;
+      if (!isPlaying) {
+        isPlaying = true; lastTickTs = null;
+        if (!(EASE_S > 0)) effRate = playbackRate;
+        requestAnimationFrame(frame);
+      }
+    } else if (isPlaying && EASE_S > 0 && !hard) {
+      pausing = true;
+    } else {
+      isPlaying = false; pausing = false; effRate = 0;
+    }
     updateControls();
+  }
+
+  function seekTo(t) {
+    currentTime = Math.max(0, Math.min(maxTime, t));
+    progress = progressAt(currentTime);
   }
 
   function updateControls() {
     if (!controls) return;
     if (controls.play) {
-      controls.play.textContent = isPlaying ? '❚❚' : '▶';
-      controls.play.title = isPlaying ? 'Pause' : 'Play';
+      const playing = isPlaying && !pausing;
+      controls.play.textContent = playing ? '❚❚' : '▶';
+      controls.play.title = playing ? 'Pause' : 'Play';
     }
     if (controls.slider && document.activeElement !== controls.slider) controls.slider.value = currentTime;
     if (controls.label) controls.label.textContent = formatTime(currentTime);
     if (controls.clock) {   // playback position / total length, at the current speed
       const total = durationSec / playbackRate;
-      controls.clock.textContent = formatClock(total * currentTime / maxTime) + ' / ' + formatClock(total);
+      controls.clock.textContent = formatClock(total * progress) + ' / ' + formatClock(total);
     }
     if (controls.speed) controls.speed.textContent = playbackRate + '×';
   }
@@ -900,14 +1184,14 @@ function createTimeline(deck, props) {
     const c = { root: root, play: null, slider: null, label: null, clock: null, speed: null };
     if (CONTROLS.show_play) c.play = button('', 'Pause', function () { setPlaying(!isPlaying); });
     if (CONTROLS.show_restart) {
-      button('↺', 'Restart', function () { currentTime = 0; lastTickTs = null; redraw(); setPlaying(true); });
+      button('↺', 'Restart', function () { seekTo(0); effRate = 0; lastTickTs = null; redraw(); setPlaying(true); });
     }
     if (CONTROLS.show_scrubber) {
       const slider = document.createElement('input');
       slider.type = 'range'; slider.min = 0; slider.max = maxTime; slider.step = maxTime / 1000;
       slider.style.cssText = 'flex:1;min-width:60px;accent-color:#fff;';
       slider.addEventListener('input', function () {
-        currentTime = Number(slider.value); lastTickTs = null; redraw();
+        seekTo(Number(slider.value)); lastTickTs = null; redraw();
       });
       root.appendChild(slider);
       c.slider = slider;
@@ -950,13 +1234,25 @@ function createTimeline(deck, props) {
     const late = sinceLast - fpsInterval;
     lastFrameTime = late > fpsInterval * 3 ? timestamp : timestamp - Math.max(0, late % fpsInterval);
 
-    // Advance by elapsed wall time so playback lasts durationSec whatever the frame rate.
+    // Advance by elapsed wall time so playback lasts durationSec whatever the frame rate. The rate
+    // eases towards its target (the chosen speed, or 0 while pausing) over EASE_S, and slows into
+    // the end of the clip; playback progress then maps to data time (adaptive speed).
     const dt = lastTickTs === null ? 0 : timestamp - lastTickTs;
     lastTickTs = timestamp;
-    if (currentTime < maxTime) {
-      currentTime = Math.min(maxTime, currentTime + dt * timePerMs * playbackRate);
+    const target = pausing ? 0 : playbackRate;
+    effRate = EASE_S > 0 ? effRate + (target - effRate) * (1 - Math.exp(-dt / (EASE_S * 1000 / 3))) : target;
+    if (pausing && effRate < 0.02 * playbackRate) {
+      setPlaying(false, true);
+      redraw();
+      return;
+    }
+    if (progress < 1) {
+      const leftS = (1 - progress) * durationSec / playbackRate;            // wall seconds to the end
+      const endEase = EASE_S > 0 ? 0.12 + 0.88 * smoothstep(0, EASE_S, leftS) : 1;
+      progress = Math.min(1, progress + dt / (durationSec * 1000) * effRate * endEase);
+      currentTime = timeAt(progress);
     } else {
-      setPlaying(false);        // Stop animation at the end
+      setPlaying(false, true);  // Stop animation at the end
     }
 
     redraw();
@@ -973,8 +1269,18 @@ function createTimeline(deck, props) {
 
   function onEscape(e) { if (e.key === 'Escape') stopFollow(); }
 
+  // The terrain with its height multiplied by EXAG (the decoder scales every channel and the offset).
+  function exaggerated(layer) {
+    if (EXAG === 1 || !layer || !layer.constructor || layer.constructor.layerName !== 'TerrainLayer') return layer;
+    const d = layer.props.elevationDecoder || {};
+    return layer.clone({ elevationDecoder: {
+      rScaler: (d.rScaler || 0) * EXAG, gScaler: (d.gScaler || 0) * EXAG,
+      bScaler: (d.bScaler || 0) * EXAG, offset: (d.offset || 0) * EXAG,
+    } });
+  }
+
   function start() {
-    baseLayers = deck.props.layers;
+    baseLayers = deck.props.layers.map(exaggerated);
     animatedById = {};
     LAYER_SPECS.forEach(function (spec) {
       const base = baseLayers.find(function (l) { return l && l.id === spec.id; });
@@ -982,6 +1288,9 @@ function createTimeline(deck, props) {
       const animator = ANIMATORS[spec.kind];
       animatedById[spec.id] = { base: base, spec: spec, animator: animator, state: animator.init(base, spec) };
     });
+    buildPacing();
+    // 3D-model animations read deck's own Timeline; the exporter sets it to the playback time.
+    deckTimeline = (deck.animationLoop && deck.animationLoop.timeline) || null;
 
     // Rotation and following make the camera controlled (frame()/followView() set viewState), so
     // deck stops applying user input by itself: apply every pan/zoom/rotate here immediately,
@@ -1074,12 +1383,18 @@ function createTimeline(deck, props) {
     get durationSec() { return durationSec; },
     get specs()    { return LAYER_SPECS; },  // animated layers (id, kind, window), for the exporter's camera
     get time()     { return currentTime; },
-    pause() { setPlaying(false); },
+    // Playback progress (0..1) <-> timeline time: the exporter spaces frames evenly in progress, so
+    // adaptive speed shows in the video as it does on the map.
+    timeAt(p)     { return timeAt(p); },
+    progressAt(t) { return progressAt(t); },
+    pause() { setPlaying(false, true); },
     setView(view) { releaseCamera(view); },
     play()  { setPlaying(true); },
     renderAt(t) {
-      isPlaying = false;
-      currentTime = Math.max(0, Math.min(maxTime, t));
+      isPlaying = false; pausing = false; effRate = 0;
+      seekTo(t);
+      // Headless: 3D-model animations at the playback time, so every exported frame is exact.
+      if (headless && deckTimeline) { deckTimeline.pause(); deckTimeline.setTime(progress * durationSec * 1000); }
       redraw();
     }
   };
