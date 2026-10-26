@@ -97,7 +97,10 @@ function createTimeline(deck, props) {
   let progress      = 0;     // playback position 0..1; equals currentTime / maxTime without adaptive speed
   let effRate       = 0;     // eased playback rate actually applied (0 at load, so playback eases in)
   let pausing       = false; // easing down to a stop
-  let isPlaying     = true;
+  let isPlaying     = false; // autoplay starts once the map has loaded (waitForMap)
+  let loadingMap    = true;  // waiting for the base map and tiles before autoplay
+  let autoplayOff   = false; // the viewer (or the exporter) took control while the map was loading
+  let labelsOn      = true;  // marker labels (the exporter can switch them off for a video)
   let destroyed     = false;
   let lastFrameTime = 0;
   let lastTickTs    = null;  // wall clock of the last advance; null -> next frame advances 0
@@ -608,7 +611,7 @@ function createTimeline(deck, props) {
     }
     if (TextCtor) {
       const texts = [];
-      if (spec.labelCol) {
+      if (spec.labelCol && labelsOn) {
         heads.forEach(function (d) { if (d.label) texts.push({ position: d.position, text: d.label }); });
       }
       if (texts.length) {
@@ -1084,6 +1087,7 @@ function createTimeline(deck, props) {
   // Play / pause. A pause eases the speed down to a stop over EASE_S (interactive); `hard` stops at
   // once (the end of the clip, the exporter).
   function setPlaying(on, hard) {
+    if (loadingMap) autoplayOff = true;   // a choice made while loading replaces autoplay
     if (on) {
       if (progress >= 1) { progress = 0; currentTime = 0; effRate = 0; }   // play at the end -> start over
       pausing = false;
@@ -1113,7 +1117,9 @@ function createTimeline(deck, props) {
       controls.play.title = playing ? 'Pause' : 'Play';
     }
     if (controls.slider && document.activeElement !== controls.slider) controls.slider.value = currentTime;
-    if (controls.label) controls.label.textContent = formatTime(currentTime);
+    if (controls.label) {
+      controls.label.textContent = loadingMap && !autoplayOff ? 'Loading map…' : formatTime(currentTime);
+    }
     if (controls.clock) {   // playback position / total length, at the current speed
       const total = durationSec / playbackRate;
       controls.clock.textContent = formatClock(total * progress) + ' / ' + formatClock(total);
@@ -1234,6 +1240,48 @@ function createTimeline(deck, props) {
 
   function onEscape(e) { if (e.key === 'Escape') stopFollow(); }
 
+  // The view that fits [w, s, e, n] in a width x height frame with `padding` px to spare, seen at
+  // `pitch` and `bearing`. A plain fitBounds frames the box as if looking straight down; on a
+  // tilted map the near edge then spills off the bottom and the far side leaves the top empty.
+  // So start there and correct by the box's projected outline: rescale the zoom to fill the frame
+  // and move the centre to where the outline's middle lands, a few times until it settles.
+  function fitBoundsView(box, o) {
+    const width = o.width, height = o.height, pitch = o.pitch || 0, bearing = o.bearing || 0;
+    const pad = Math.max(0, Math.min(o.padding || 0, Math.min(width, height) / 2 - 10));
+    const MIN_DEG = o.minDeg != null ? o.minDeg : 0.01;   // a point or a short track: ~1 km, not street level
+    const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+    const hw = Math.max(box[2] - box[0], MIN_DEG) / 2, hh = Math.max(box[3] - box[1], MIN_DEG) / 2;
+    const fit = new WebMercatorViewport({ width: width, height: height })
+      .fitBounds([[cx - hw, cy - hh], [cx + hw, cy + hh]], { padding: pad });
+    const view = { longitude: fit.longitude, latitude: fit.latitude, zoom: fit.zoom, pitch: pitch, bearing: bearing };
+    if (pitch || bearing) {
+      // The outline: corners and edge midpoints (the far edge bows on a tilted map).
+      const pts = [];
+      for (let i = 0; i <= 2; i++) {
+        for (let j = 0; j <= 2; j++) {
+          if (i === 1 && j === 1) continue;
+          pts.push([cx - hw + i * hw, cy - hh + j * hh]);
+        }
+      }
+      for (let k = 0; k < 6; k++) {
+        const vp = new WebMercatorViewport(Object.assign({ width: width, height: height }, view));
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const p of pts) {
+          const xy = vp.project(p);
+          if (!isFinite(xy[0]) || !isFinite(xy[1])) return view;   // behind the camera: keep the last fit
+          x0 = Math.min(x0, xy[0]); x1 = Math.max(x1, xy[0]); y0 = Math.min(y0, xy[1]); y1 = Math.max(y1, xy[1]);
+        }
+        const scale = Math.min((width - 2 * pad) / Math.max(x1 - x0, 1), (height - 2 * pad) / Math.max(y1 - y0, 1));
+        const mid = vp.unproject([(x0 + x1) / 2, (y0 + y1) / 2]);
+        const dz = Math.log2(scale);
+        view.longitude = mid[0]; view.latitude = mid[1]; view.zoom += dz;
+        if (Math.abs(dz) < 0.005 && Math.abs((x0 + x1) / 2 - width / 2) < 1 && Math.abs((y0 + y1) / 2 - height / 2) < 1) break;
+      }
+    }
+    if (o.maxZoom != null) view.zoom = Math.min(view.zoom, o.maxZoom);
+    return view;
+  }
+
   // Frame the opening view on the animated tracks at the map's real size (as the video's Fit
   // camera does), keeping the given pitch and bearing. The view passed in assumes an 800x600
   // map, so on a larger window it opens further out than it needs to.
@@ -1253,20 +1301,51 @@ function createTimeline(deck, props) {
     const canvas = deck.getCanvas ? deck.getCanvas() : deck.canvas;
     const width = deck.width || (canvas && canvas.clientWidth), height = deck.height || (canvas && canvas.clientHeight);
     if (!(e >= w && n >= s) || !width || !height) return;
-    const MIN_DEG = 0.01;   // a single point or a short track: frame ~1 km, not street level
-    const cx = (w + e) / 2, cy = (s + n) / 2;
-    const hw = Math.max(e - w, MIN_DEG) / 2, hh = Math.max(n - s, MIN_DEG) / 2;
-    const pad = Math.max(0, Math.min(fit.padding || 0, Math.min(width, height) / 2 - 10));
+    const ivs = deck.props.initialViewState || {};
     let v;
     try {
-      v = new WebMercatorViewport({ width: width, height: height })
-        .fitBounds([[cx - hw, cy - hh], [cx + hw, cy + hh]], { padding: pad });
+      v = fitBoundsView([w, s, e, n], { width: width, height: height, padding: fit.padding, maxZoom: fit.maxZoom,
+                                        pitch: ivs.pitch, bearing: ivs.bearing });
     } catch (err) { return; }
-    const view = Object.assign({}, deck.props.initialViewState || {}, {
-      longitude: v.longitude, latitude: v.latitude,
-      zoom: fit.maxZoom != null ? Math.min(v.zoom, fit.maxZoom) : v.zoom,
-    });
-    deck.setProps({ initialViewState: view });
+    deck.setProps({ initialViewState: Object.assign({}, ivs, v) });
+  }
+
+  // --- Waiting for the map before autoplay ------------------------------------------
+  // The base map (Mapbox/Carto style under deck, if any), every deck layer (terrain and tile
+  // layers report isLoaded once the tiles in view are in) and a quiet network for QUIET_MS.
+  const QUIET_MS = 400, MAP_WAIT_MAX_MS = 20000;
+  let lastResourceTs = (typeof performance !== 'undefined') ? performance.now() : 0;
+  let resourceObserver = null;
+  try {
+    resourceObserver = new PerformanceObserver(function () { lastResourceTs = performance.now(); });
+    resourceObserver.observe({ type: 'resource', buffered: false });
+  } catch (e) { resourceObserver = null; }
+
+  function layersLoaded() {
+    try {
+      const lm = deck.layerManager;
+      const ls = (lm && lm.getLayers) ? lm.getLayers() : [];
+      return ls.every(function (l) { return l.parent || l.isLoaded !== false; });
+    } catch (e) { return true; }
+  }
+  function baseMapLoaded() {
+    try {
+      const host = window.deckInstance || deck;
+      const map = host.getMapboxMap ? host.getMapboxMap() : null;
+      if (!map) return true;
+      return map.loaded() && (!map.areTilesLoaded || map.areTilesLoaded());
+    } catch (e) { return true; }
+  }
+  function mapLoaded() {
+    return layersLoaded() && baseMapLoaded() && (performance.now() - lastResourceTs >= QUIET_MS);
+  }
+  function waitForMap(done) {
+    const t0 = performance.now();
+    (function poll() {
+      if (destroyed) return;
+      if (mapLoaded() || performance.now() - t0 > MAP_WAIT_MAX_MS) { done(); return; }
+      setTimeout(poll, 100);
+    })();
   }
 
   function start() {
@@ -1353,7 +1432,14 @@ function createTimeline(deck, props) {
     }
 
     if (CONTROLS.visible) buildControls();
-    requestAnimationFrame(frame);
+    redraw();
+    // Autoplay once the map has loaded, so playback doesn't run over a half-drawn base map.
+    waitForMap(function () {
+      loadingMap = false;
+      if (resourceObserver) { resourceObserver.disconnect(); resourceObserver = null; }
+      if (!autoplayOff) setPlaying(true);
+      else updateControls();
+    });
   }
 
   // Start once pydeck's JSON conversion has handed deck its layers.
@@ -1380,7 +1466,16 @@ function createTimeline(deck, props) {
     pause() { setPlaying(false, true); },
     setView(view) { releaseCamera(view); },
     play()  { setPlaying(true); },
+    // The base map, every layer's tiles and the network are settled (see waitForMap).
+    mapLoaded() { return layersLoaded() && baseMapLoaded(); },
+    // The data time at t as the playback bar shows it (date-time at the UTC offset, or elapsed).
+    formatTime(t) { return formatTime(t); },
+    // Marker labels on or off (the exporter's video overlays).
+    setLabels(on) { labelsOn = !!on; redraw(); },
+    // The view fitting box [w, s, e, n] at a size, pitch and bearing (see fitBoundsView).
+    fitBounds(box, opts) { return fitBoundsView(box, opts); },
     renderAt(t) {
+      if (loadingMap) autoplayOff = true;
       isPlaying = false; pausing = false; effRate = 0;
       seekTo(t);
       // Headless: 3D-model animations at the playback time, so every exported frame is exact.
@@ -1395,6 +1490,7 @@ function createTimeline(deck, props) {
       destroyed = true;
       isPlaying = false;
       clearInterval(startTimer);
+      if (resourceObserver) resourceObserver.disconnect();
       document.removeEventListener('keydown', onEscape);
       if (controls) controls.root.remove();
       controls = null;
