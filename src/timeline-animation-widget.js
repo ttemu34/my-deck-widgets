@@ -5,8 +5,8 @@
 // turns the base layer + current time into the layers actually drawn this frame:
 //
 // - 'trips': a TripsLayer becomes a comet over a historic trail (+ optional glow),
-//   with a head marker (dot or glTF model), pulse ring, labels, data-gap lines/tags,
-//   hover tooltips and click-to-follow.
+//   with a head marker (dot or glTF model), pulse ring, labels, hover tooltips and
+//   click-to-follow. Across a data gap the trail breaks and the marker is hidden.
 // - 'window': any layer with a per-row time (`__t`, or `properties.__t`) shows only
 //   the rows inside [t - window, t], faded via DataFilterExtension on the GPU.
 //
@@ -110,7 +110,6 @@ function createTimeline(deck, props) {
   let _deckViewState = null; // mirrors interactive view state so rotation + user pan compose
   let userInteracting = false; // user is mid-drag/zoom -> hold auto-rotation
   let TextCtor  = null;      // labels and 'no data' tags
-  let LineCtor  = null;      // faint lines across data gaps
   let sunLight  = null;      // DirectionalLight that sunAt() moves with the clock (SUN.on)
   let shadowSun = null;      // { direction, strength } of the current sun, for 3D-marker shadows
   let following = null;      // { layerId, fi }: the marker the camera follows (click_to_follow)
@@ -441,7 +440,7 @@ function createTimeline(deck, props) {
 
   const TURN_PLAYBACK_S = 0.1;   // playback seconds per unit of turn_smoothing, as a floor on the window
 
-  // A feature's marker at time t: position, orientation and speed, or { gap } while t is inside a
+  // A feature's marker at time t: position, orientation and speed, or null while t is inside a
   // data gap. When the subject is essentially stationary we HOLD the last good heading and zero
   // the pitch, so the model doesn't spin or tip over while milling in place (e.g. crop-raiding).
   function headAt(tr, i, t, st, head, spec) {
@@ -478,7 +477,7 @@ function createTimeline(deck, props) {
     const j = seek(T, t, st.cursors[i]);
     st.cursors[i] = j;
     const t0 = T[j], t1 = T[j + 1];
-    if (tr.gap[j]) return { gap: true, pos: C[j], gapS: t1 - t0 };
+    if (tr.gap[j]) return null;   // inside a data gap: no marker
     const f = (t1 > t0) ? (t - t0) / (t1 - t0) : 0;
     const a = C[j], b = C[j + 1];
     const az = a[2] || 0, bz = b[2] || 0;
@@ -550,24 +549,15 @@ function createTimeline(deck, props) {
     });
   }
 
-  function formatDuration(s) {
-    const h = s / 3600;
-    return h >= 48 ? (h / 24).toFixed(1) + ' d' : h >= 1 ? h.toFixed(1) + ' h' : Math.round(s / 60) + ' min';
-  }
-
-  // Markers at time t (st.heads) and the subjects currently inside a data gap (st.gapNow).
+  // Markers at time t (st.heads). A subject inside a data gap has no marker until its data resumes.
   function headData(base, st, spec, t) {
     const feats = base.props.data || [];
     const head = spec.head;
-    const heads = [], gapNow = [];
+    const heads = [];
     for (let i = 0; i < feats.length; i++) {
       const r = headAt(st.tracks[i], i, t, st, head, spec);
       if (!r) continue;
       const label = st.labels[i];
-      if (r.gap) {
-        gapNow.push({ position: r.pos, text: (label ? label + ' · ' : '') + 'no data ' + formatDuration(r.gapS) });
-        continue;
-      }
       const col = head.color || st.colors[i];
       const look = speedLook(r.speed, st, spec);
       const d = { position: r.pos, color: col, heading: r.heading, pitch: r.pitch, fi: i, label: label,
@@ -580,7 +570,6 @@ function createTimeline(deck, props) {
       heads.push(d);
     }
     st.heads = heads;
-    st.gapNow = gapNow;
     return heads;
   }
 
@@ -589,7 +578,7 @@ function createTimeline(deck, props) {
     return (head.kind === 'dot' && head.dot.radiusUnits === 'pixels') ? head.dot.getRadius : 14;
   }
 
-  // Pulse, label and gap layers drawn over the markers. All depend on t only (the pulse phase is
+  // Pulse and label layers drawn over the markers. All depend on t only (the pulse phase is
   // playback seconds), so a paused frame and an exported frame look the same.
   function decorLayers(base, st, spec, t) {
     const out = [];
@@ -616,26 +605,11 @@ function createTimeline(deck, props) {
         updateTriggers: { getPosition: t, getRadius: t, getLineColor: t },
       }));
     }
-    if (LineCtor && st.gapLines.length) {
-      const lines = st.gapLines.filter(function (g) { return g.t0 <= t; });   // once the gap has begun
-      out.push(new LineCtor({
-        id: base.id + '-gaps',
-        data: lines,
-        getSourcePosition: function (d) { return d.from; },
-        getTargetPosition: function (d) { return d.to; },
-        getColor: function (d) { return d.color; },
-        getWidth: 1.5,
-        widthUnits: 'pixels',
-        opacity: 0.45,
-        pickable: false,
-      }));
-    }
     if (TextCtor) {
       const texts = [];
       if (spec.labelCol) {
         heads.forEach(function (d) { if (d.label) texts.push({ position: d.position, text: d.label }); });
       }
-      (st.gapNow || []).forEach(function (g) { texts.push({ position: g.position, text: g.text, gap: true }); });
       if (texts.length) {
         const lift = spec.head.kind === 'model' ? 44 : markerRadiusPx(spec.head) + 12;   // clear a 3D model's height
         out.push(new TextCtor({
@@ -645,10 +619,10 @@ function createTimeline(deck, props) {
           getText: function (d) { return d.text; },
           getSize: 12,
           sizeUnits: 'pixels',
-          getPixelOffset: function (d) { return d.gap ? [0, 0] : [0, -lift]; },
-          getColor: function (d) { return d.gap ? [235, 235, 235, 255] : [255, 255, 255, 255]; },
+          getPixelOffset: [0, -lift],
+          getColor: [255, 255, 255, 255],
           background: true,
-          getBackgroundColor: function (d) { return d.gap ? [90, 90, 90, 200] : [20, 20, 20, 185]; },
+          getBackgroundColor: [20, 20, 20, 185],
           backgroundPadding: [5, 3],
           fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
           fontWeight: 600,
@@ -795,15 +769,6 @@ function createTimeline(deck, props) {
         function col(name) {
           return feats.map(function (f) { const v = name ? f[name] : null; return v == null ? '' : String(v); });
         }
-        // Faint lines across data gaps, in the history colour (or the track's colour without history).
-        const gapLines = [];
-        tracks.forEach(function (tr, i) {
-          if (!tr) return;
-          tr.gap.forEach(function (g, j) {
-            if (g) gapLines.push({ from: tr.C[j], to: tr.C[j + 1], t0: tr.T[j],
-                                   color: spec.showHistory ? spec.historyColor : colors[i] });
-          });
-        });
         // Speeds while moving, for the speed response (typical) and the speed colours (95th percentile).
         const moving = [];
         tracks.forEach(function (tr) {
@@ -817,7 +782,7 @@ function createTimeline(deck, props) {
         const st = {
           cursors: new Array(n).fill(0), lastHeading: new Array(n).fill(0),
           tracks: tracks, colors: colors, labels: col(spec.labelCol), tips: col(spec.tipCol),
-          trailData: trailRows(feats, tracks, spec), gapLines: gapLines, heads: [], gapNow: [],
+          trailData: trailRows(feats, tracks, spec), heads: [],
           typKmh: moving.length ? moving[moving.length >> 1] : 0,
           p95Kmh: moving.length ? moving[Math.floor(moving.length * 0.95)] : 0,
           anims: {},
@@ -1334,7 +1299,6 @@ function createTimeline(deck, props) {
     }
 
     TextCtor = resolveLayer('TextLayer');
-    LineCtor = resolveLayer('LineLayer');
     setupSun();
 
     if (needsDot) {
