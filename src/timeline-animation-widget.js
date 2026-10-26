@@ -1241,7 +1241,7 @@ function createTimeline(deck, props) {
   function onEscape(e) { if (e.key === 'Escape') stopFollow(); }
 
   // The view that fits [w, s, e, n] in a width x height frame with `padding` px to spare, seen at
-  // `pitch` and `bearing`. A plain fitBounds frames the box as if looking straight down; on a
+  // `pitch` and `bearing` through a `fovy`-degree lens (deck's default when unset). A plain fitBounds frames the box as if looking straight down; on a
   // tilted map the near edge then spills off the bottom and the far side leaves the top empty.
   // So start there and correct by the box's projected outline: rescale the zoom to fill the frame
   // and move the centre to where the outline's middle lands, a few times until it settles.
@@ -1254,7 +1254,8 @@ function createTimeline(deck, props) {
     const fit = new WebMercatorViewport({ width: width, height: height })
       .fitBounds([[cx - hw, cy - hh], [cx + hw, cy + hh]], { padding: pad });
     const view = { longitude: fit.longitude, latitude: fit.latitude, zoom: fit.zoom, pitch: pitch, bearing: bearing };
-    if (pitch || bearing) {
+    if (o.fovy) view.fovy = o.fovy;
+    if (pitch || bearing || o.fovy) {
       // The outline: corners and edge midpoints (the far edge bows on a tilted map).
       const pts = [];
       for (let i = 0; i <= 2; i++) {

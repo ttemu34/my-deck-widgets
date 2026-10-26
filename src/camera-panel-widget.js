@@ -52,11 +52,10 @@ function createCameraPanel(CAMERAS) {
   const PREVIEW_FPS = 30;
   let views = null, lastView = null, panel = null, body = null, preview = false;
 
-  // A camera being edited: its type, every type's field values (so switching type and back keeps
-  // them), keyframes (keyframes camera), the subject to follow without keyframes, and segments
-  // (sequence camera; each segment holds a camera of its own).
+  // A camera being edited: its type and every type's field values (so switching type and back
+  // keeps them).
   function newCamera(type) {
-    const cs = { type: type, values: {}, keyframes: [], subject: '', segments: [] };
+    const cs = { type: type, values: {} };
     CAMERAS.forEach(function (c) {
       cs.values[c.type] = {};
       c.fields.forEach(function (f) {
@@ -65,76 +64,29 @@ function createCameraPanel(CAMERAS) {
     });
     return cs;
   }
-  function newSegment(until, type) { return { until: until, cam: newCamera(type), open: false }; }
   const root = newCamera(CAMERAS[0].type);
-  root.segments = [newSegment(0.2, 'fly_around'), newSegment(0.85, 'follow'), newSegment(1, 'fit')];
 
   function camera(type) { return CAMERAS.find(function (c) { return c.type === type; }); }
   function camSpan() { return window.__cam.span() || window.__tripsAnim.span; }
-  function progress() { return Math.max(0, Math.min(1, window.__tripsAnim.time / camSpan())); }
-  function round(x, n) { const p = Math.pow(10, n); return Math.round(x * p) / p; }
   function currentView() {
     try {
       const v = window.deckInstance.getViewports()[0];
       return { longitude: v.longitude, latitude: v.latitude, zoom: v.zoom, pitch: v.pitch, bearing: v.bearing };
     } catch (e) { return lastView; }
   }
-  // Clip range [start, end] of each sequence segment.
-  function segmentRanges(cs) {
-    let prev = 0;
-    return cs.segments.map(function (s, i) {
-      const end = i === cs.segments.length - 1 ? 1 : Math.max(prev, Math.min(1, s.until));
-      const r = [prev, end];
-      prev = end;
-      return r;
-    });
-  }
-
   // --- Settings: exactly the camera object render_animation takes -------------------------
   function settings(cs) {
     const out = { type_: cs.type }, values = cs.values[cs.type];
     // Unset values are the defaults; leaving them out keeps optional limits from rejecting null.
     Object.keys(values).forEach(function (k) { if (values[k] != null) out[k] = values[k]; });
-    if (cs.type === 'keyframes') {
-      if (cs.keyframes.length) {
-        out.keyframes = cs.keyframes.map(function (k) {
-          return { t: round(k.t, 4), lon: round(k.lon, 6), lat: round(k.lat, 6),
-                   zoom: round(k.zoom, 2), pitch: round(k.pitch, 1), bearing: round(k.bearing, 1) };
-        });
-      } else {
-        out.source = { type_: 'subject', subject: cs.subject || null };
-      }
-    }
-    if (cs.type === 'sequence') {
-      out.segments = cs.segments.map(function (s, i) {
-        return { until: i === cs.segments.length - 1 ? 1 : round(s.until, 4), camera: settings(s.cam) };
-      });
-    }
     return out;
   }
 
-  // Same shape as render_animation's _camera_opts; keyframes resolved as _resolve_keyframes
-  // does for complete ones (sorted, bearings unwrapped for shortest turns).
+  // Same shape as render_animation's _camera_opts.
   function pathOptions(cs, dims) {
     const s = settings(cs);
-    const o = Object.assign({}, s, dims, { preset: s.type_, auto_keyframe_count: 12, keyframes: null });
-    if (cs.type === 'keyframes') o.subject = cs.subject || null;
-    delete o.type_; delete o.source;
-    if (cs.keyframes.length >= 2 && cs.type === 'keyframes') {
-      const K = cs.keyframes.slice().sort(function (a, b) { return a.t - b.t; }).map(function (k) {
-        return Object.assign({}, k);
-      });
-      for (let i = 1; i < K.length; i++) {
-        const d = ((K[i].bearing - K[i - 1].bearing + 180) % 360 + 360) % 360 - 180;
-        K[i].bearing = K[i - 1].bearing + d;
-      }
-      o.keyframes = K;
-    }
-    if (cs.type === 'sequence') {
-      o.segments = cs.segments.map(function (seg, i) {
-        return { until: i === cs.segments.length - 1 ? 1 : seg.until, camera: pathOptions(seg.cam, dims) };
-      });
-    }
+    const o = Object.assign({}, s, dims, { preset: s.type_ });
+    delete o.type_;
     return o;
   }
 
@@ -172,7 +124,6 @@ function createCameraPanel(CAMERAS) {
   const BUTTON = 'padding:4px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.35);' +
     'background:rgba(255,255,255,0.1);color:#fff;font:inherit;cursor:pointer;';
   const SECTION = 'margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.2);';
-  const NESTED = 'margin-top:6px;padding:4px 0 6px 10px;border-left:2px solid rgba(255,255,255,0.25);';
 
   function el(tag, css, text) {
     const e = document.createElement(tag);
@@ -215,12 +166,6 @@ function createCameraPanel(CAMERAS) {
       return select(f.options.map(function (o) { return [o, o]; }), values[f.name],
                     function (v) { values[f.name] = v; invalidate(); });
     }
-    if (f.name === 'layer') {   // pick one of the page's time-window layers
-      const ids = window.__tripsAnim.specs.filter(function (s) { return s.kind === 'window'; })
-                                          .map(function (s) { return [s.id, s.id]; });
-      return select([['', 'All time-window layers']].concat(ids), values[f.name],
-                    function (v) { values[f.name] = v || null; invalidate(); });
-    }
     input = el('input', INPUT);
     if (f.type === 'array') {   // list of names, typed comma-separated
       input.type = 'text'; input.placeholder = 'all, or names separated by commas';
@@ -260,115 +205,12 @@ function createCameraPanel(CAMERAS) {
     return input;
   }
 
-  // Keyframes of `cs`, which runs over clip range `range`: times are stored relative to it.
-  function keyframeSection(parent, cs, range) {
-    const box = el('div', SECTION);
-    const len = Math.max(1e-6, range[1] - range[0]);
-    box.appendChild(el('div', 'font-weight:600;', 'Keyframes'));
-    box.appendChild(el('div', 'opacity:0.7;margin-top:2px;',
-      'Scrub to a moment, frame the map, then add it. With fewer than 2 keyframes the camera follows a subject.'));
-    const subject = el('input', INPUT);
-    subject.type = 'text'; subject.placeholder = 'longest-running track'; subject.value = cs.subject;
-    subject.addEventListener('change', function () { cs.subject = subject.value.trim(); invalidate(); });
-    row(box, 'Subject to follow', 'Value identifying the subject in any column (e.g. its name).', subject);
-    const add = el('div', 'margin-top:8px;');
-    button(add, '+ Add current view', 'Add a keyframe at the current time with the current view', function () {
-      const v = currentView();
-      if (!v) return;
-      const t = Math.max(0, Math.min(1, (progress() - range[0]) / len));
-      cs.keyframes.push({ t: t, lon: v.longitude, lat: v.latitude, zoom: v.zoom, pitch: v.pitch || 0,
-                          bearing: v.bearing || 0 });
-      cs.keyframes.sort(function (a, b) { return a.t - b.t; });
-      invalidate(); render();
-    });
-    box.appendChild(add);
-    cs.keyframes.forEach(function (k, i) {
-      const r = el('div', 'display:flex;align-items:center;gap:6px;margin-top:6px;font-variant-numeric:tabular-nums;');
-      r.appendChild(el('span', 'flex:1;', ((range[0] + k.t * len) * 100).toFixed(0) + '%  z' + k.zoom.toFixed(1) +
-        '  tilt ' + k.pitch.toFixed(0) + '°  hdg ' + k.bearing.toFixed(0) + '°'));
-      button(r, 'Go', 'Jump to this keyframe', function () {
-        window.__tripsAnim.renderAt((range[0] + k.t * len) * camSpan());
-        if (!preview) window.__tripsAnim.setView({ longitude: k.lon, latitude: k.lat, zoom: k.zoom,
-                                                  pitch: k.pitch, bearing: k.bearing });
-      });
-      button(r, 'Set', 'Replace with the current view (keeps its time)', function () {
-        const v = currentView();
-        if (!v) return;
-        Object.assign(k, { lon: v.longitude, lat: v.latitude, zoom: v.zoom, pitch: v.pitch || 0,
-                           bearing: v.bearing || 0 });
-        invalidate(); render();
-      });
-      button(r, '✕', 'Remove', function () { cs.keyframes.splice(i, 1); invalidate(); render(); });
-      box.appendChild(r);
-    });
-    parent.appendChild(box);
-  }
-
-  function sequenceSection(parent, cs) {
-    const box = el('div', SECTION);
-    box.appendChild(el('div', 'font-weight:600;', 'Segments'));
-    box.appendChild(el('div', 'opacity:0.7;margin-top:2px;',
-      'Each segment uses its own camera until its end, blending into the next.'));
-    const ranges = segmentRanges(cs);
-    cs.segments.forEach(function (seg, i) {
-      const last = i === cs.segments.length - 1;
-      const r = el('div', 'display:flex;align-items:center;gap:6px;margin-top:8px;');
-      r.appendChild(el('span', 'min-width:16px;opacity:0.8;', (i + 1) + '.'));
-      const type = select(CAMERAS.filter(function (c) { return c.type !== 'sequence'; })
-                                 .map(function (c) { return [c.type, c.title]; }),
-                          seg.cam.type, function (v) { seg.cam.type = v; invalidate(); render(); });
-      type.style.flex = '1';
-      r.appendChild(type);
-      if (last) {
-        r.appendChild(el('span', 'opacity:0.7;white-space:nowrap;', 'to end'));
-      } else {
-        const until = el('input', INPUT + 'width:58px;');
-        until.type = 'number'; until.min = 1; until.max = 99; until.step = 1;
-        until.value = Math.round(seg.until * 100);
-        until.title = 'Clip position (%) where this segment ends';
-        until.addEventListener('change', function () {
-          const lo = i > 0 ? cs.segments[i - 1].until : 0, hi = cs.segments[i + 1].until;
-          seg.until = Math.max(lo, Math.min(hi, (Number(until.value) || 0) / 100));
-          invalidate(); render();
-        });
-        r.appendChild(until);
-        r.appendChild(el('span', 'opacity:0.7;', '%'));
-      }
-      button(r, seg.open ? '▾' : '▸', 'Edit this camera', function () { seg.open = !seg.open; render(); });
-      if (cs.segments.length > 1) {
-        button(r, '✕', 'Remove segment', function () {
-          cs.segments.splice(i, 1);
-          if (cs.segments.length) cs.segments[cs.segments.length - 1].until = 1;
-          invalidate(); render();
-        });
-      }
-      box.appendChild(r);
-      if (seg.open) {
-        const nested = el('div', NESTED);
-        cameraForm(nested, seg.cam, ranges[i], true);
-        box.appendChild(nested);
-      }
-    });
-    const add = el('div', 'margin-top:8px;');
-    button(add, '+ Add segment', 'Split the last segment in two', function () {
-      const r = ranges[ranges.length - 1];
-      cs.segments.splice(cs.segments.length - 1, 0, newSegment(round((r[0] + r[1]) / 2, 3), 'follow'));
-      invalidate(); render();
-    });
-    box.appendChild(add);
-    parent.appendChild(box);
-  }
-
-  function cameraForm(parent, cs, range, nested) {
-    if (!nested) {
-      row(parent, 'Camera', '', select(CAMERAS.map(function (c) { return [c.type, c.title]; }), cs.type,
-                                       function (v) { cs.type = v; invalidate(); render(); }));
-    }
+  function cameraForm(parent, cs) {
+    row(parent, 'Camera', '', select(CAMERAS.map(function (c) { return [c.type, c.title]; }), cs.type,
+                                     function (v) { cs.type = v; invalidate(); render(); }));
     const cam = camera(cs.type);
     parent.appendChild(el('div', 'opacity:0.7;margin-top:4px;', cam.description));
     cam.fields.forEach(function (f) { row(parent, f.title, f.description, fieldInput(f, cs.values[cs.type])); });
-    if (cs.type === 'keyframes') keyframeSection(parent, cs, range);
-    if (cs.type === 'sequence') sequenceSection(parent, cs);
   }
 
   function copyText(text, done) {
@@ -384,7 +226,7 @@ function createCameraPanel(CAMERAS) {
   function render() {
     const scroll = panel.scrollTop;
     body.innerHTML = '';
-    cameraForm(body, root, [0, 1], false);
+    cameraForm(body, root);
 
     const actions = el('div', SECTION);
     const prev = el('input', 'margin-right:6px;vertical-align:middle;');
