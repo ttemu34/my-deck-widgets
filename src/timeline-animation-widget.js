@@ -68,7 +68,6 @@ TimelineAnimationWidget.defaultProps = {
   pacing: { adaptive: false, maxSpeedup: 6, restKmh: 0.5, night: false },
   easeS: 0,              // seconds to ease playback speed changes (interactive only)
   followSmoothingS: 0,   // seconds for the camera to catch up with a followed marker; 0 = locked on
-  terrainExaggeration: 1,
   controls: { visible: false }  // PlaybackControls, snake_case keys as dumped by pydantic
 };
 
@@ -84,7 +83,6 @@ function createTimeline(deck, props) {
   const PACING          = props.pacing || TimelineAnimationWidget.defaultProps.pacing;
   const EASE_S          = props.easeS || 0;
   const FOLLOW_S        = props.followSmoothingS || 0;
-  const EXAG            = props.terrainExaggeration || 1;
   const CPU_FILTER_LAYERS = ['HexagonLayer'];            // aggregation layers: filter rows, not on the GPU
   // The comet's speed colours, slow -> fast (blue, teal, yellow, orange, red).
   const SPEED_RAMP = [[45, 95, 220], [40, 185, 200], [250, 220, 70], [245, 125, 40], [215, 40, 40]];
@@ -361,18 +359,19 @@ function createTimeline(deck, props) {
 
   // One feature's track as the animator uses it: coordinates C and times T (curved if asked),
   // which segments are gaps, and the typical interval between fixes (for turn smoothing).
+  // A segment is a gap if it is longer than spec.gapS or listed in the feature's `breaks`
+  // (stretches removed upstream, e.g. by a trajectory segment filter): never glide across those.
   function prepTrack(f, spec, subdiv) {
-    const Craw = f.geometry && f.geometry.coordinates, T0s = f.timestamps;
-    if (!Craw || !T0s || !Craw.length) return null;
-    // Exaggerated terrain: raise the track with it (heights were sampled at true scale).
-    const C0 = EXAG === 1 ? Craw : Craw.map(function (p) { return [p[0], p[1], (p[2] || 0) * EXAG]; });
+    const C0 = f.geometry && f.geometry.coordinates, T0s = f.timestamps;
+    if (!C0 || !T0s || !C0.length) return null;
+    const breaks = new Set(Array.isArray(f.breaks) ? f.breaks : []);
     const n = T0s.length, dts = [], lens = [];
     for (let j = 0; j + 1 < n; j++) {
       dts.push(T0s[j + 1] - T0s[j]);
       const kx = 111320 * Math.cos(C0[j][1] * Math.PI / 180);
       lens.push(Math.hypot((C0[j + 1][0] - C0[j][0]) * kx, (C0[j + 1][1] - C0[j][1]) * 110540));
     }
-    const gap0 = dts.map(function (d) { return spec.gapS != null && d > spec.gapS ? 1 : 0; });
+    const gap0 = dts.map(function (d, j) { return breaks.has(j) || (spec.gapS != null && d > spec.gapS) ? 1 : 0; });
     const med = median(dts.filter(function (d, j) { return !gap0[j] && d > 0; }));
     const medLen = median(lens.filter(function (l, j) { return !gap0[j]; }));   // typical step between fixes
     if (!spec.curvePaths || subdiv < 2) return { C: C0, T: T0s, gap: gap0, med: med, medLen: medLen };
@@ -1269,18 +1268,8 @@ function createTimeline(deck, props) {
 
   function onEscape(e) { if (e.key === 'Escape') stopFollow(); }
 
-  // The terrain with its height multiplied by EXAG (the decoder scales every channel and the offset).
-  function exaggerated(layer) {
-    if (EXAG === 1 || !layer || !layer.constructor || layer.constructor.layerName !== 'TerrainLayer') return layer;
-    const d = layer.props.elevationDecoder || {};
-    return layer.clone({ elevationDecoder: {
-      rScaler: (d.rScaler || 0) * EXAG, gScaler: (d.gScaler || 0) * EXAG,
-      bScaler: (d.bScaler || 0) * EXAG, offset: (d.offset || 0) * EXAG,
-    } });
-  }
-
   function start() {
-    baseLayers = deck.props.layers.map(exaggerated);
+    baseLayers = deck.props.layers.slice();
     animatedById = {};
     LAYER_SPECS.forEach(function (spec) {
       const base = baseLayers.find(function (l) { return l && l.id === spec.id; });
