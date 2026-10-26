@@ -26,7 +26,7 @@
 // It reads window.__camPreview / __camPreviewOn / __camPanel when the Camera
 // panel (CameraPanelWidget) is on the page.
 
-import { Widget } from '@deck.gl/core';
+import { Widget, WebMercatorViewport } from '@deck.gl/core';
 
 export class TimelineAnimationWidget extends Widget {
   placement = 'bottom-left';
@@ -68,6 +68,7 @@ TimelineAnimationWidget.defaultProps = {
   pacing: { adaptive: false, maxSpeedup: 6, restKmh: 0.5, night: false },
   easeS: 0,              // seconds to ease playback speed changes (interactive only)
   followSmoothingS: 0,   // seconds for the camera to catch up with a followed marker; 0 = locked on
+  fitView: null,         // { padding, maxZoom }: open framed on the animated tracks at the map's size
   controls: { visible: false }  // PlaybackControls, snake_case keys as dumped by pydantic
 };
 
@@ -1233,6 +1234,41 @@ function createTimeline(deck, props) {
 
   function onEscape(e) { if (e.key === 'Escape') stopFollow(); }
 
+  // Frame the opening view on the animated tracks at the map's real size (as the video's Fit
+  // camera does), keeping the given pitch and bearing. The view passed in assumes an 800x600
+  // map, so on a larger window it opens further out than it needs to.
+  function fitToTracks() {
+    const fit = props.fitView;
+    if (!fit) return;
+    let w = Infinity, s = Infinity, e = -Infinity, n = -Infinity;
+    Object.keys(animatedById).forEach(function (id) {
+      const st = animatedById[id].state;
+      ((st && st.tracks) || []).forEach(function (tr) {
+        (tr ? tr.C : []).forEach(function (p) {
+          if (p[0] < w) w = p[0]; if (p[0] > e) e = p[0];
+          if (p[1] < s) s = p[1]; if (p[1] > n) n = p[1];
+        });
+      });
+    });
+    const canvas = deck.getCanvas ? deck.getCanvas() : deck.canvas;
+    const width = deck.width || (canvas && canvas.clientWidth), height = deck.height || (canvas && canvas.clientHeight);
+    if (!(e >= w && n >= s) || !width || !height) return;
+    const MIN_DEG = 0.01;   // a single point or a short track: frame ~1 km, not street level
+    const cx = (w + e) / 2, cy = (s + n) / 2;
+    const hw = Math.max(e - w, MIN_DEG) / 2, hh = Math.max(n - s, MIN_DEG) / 2;
+    const pad = Math.max(0, Math.min(fit.padding || 0, Math.min(width, height) / 2 - 10));
+    let v;
+    try {
+      v = new WebMercatorViewport({ width: width, height: height })
+        .fitBounds([[cx - hw, cy - hh], [cx + hw, cy + hh]], { padding: pad });
+    } catch (err) { return; }
+    const view = Object.assign({}, deck.props.initialViewState || {}, {
+      longitude: v.longitude, latitude: v.latitude,
+      zoom: fit.maxZoom != null ? Math.min(v.zoom, fit.maxZoom) : v.zoom,
+    });
+    deck.setProps({ initialViewState: view });
+  }
+
   function start() {
     baseLayers = deck.props.layers.slice();
     animatedById = {};
@@ -1243,6 +1279,7 @@ function createTimeline(deck, props) {
       animatedById[spec.id] = { base: base, spec: spec, animator: animator, state: animator.init(base, spec) };
     });
     buildPacing();
+    fitToTracks();
     // 3D-model animations read deck's own Timeline; the exporter sets it to the playback time.
     deckTimeline = (deck.animationLoop && deck.animationLoop.timeline) || null;
 
