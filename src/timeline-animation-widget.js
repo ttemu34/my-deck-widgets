@@ -109,7 +109,7 @@ function createTimeline(deck, props) {
   let lastRotateTs   = 0;    // last frame timestamp used for rotation delta
   let _deckViewState = null; // mirrors interactive view state so rotation + user pan compose
   let userInteracting = false; // user is mid-drag/zoom -> hold auto-rotation
-  let TextCtor  = null;      // labels and 'no data' tags
+  let TextCtor  = null;      // marker labels
   let sunLight  = null;      // DirectionalLight that sunAt() moves with the clock (SUN.on)
   let shadowSun = null;      // { direction, strength } of the current sun, for 3D-marker shadows
   let following = null;      // { layerId, fi }: the marker the camera follows (click_to_follow)
