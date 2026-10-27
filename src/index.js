@@ -6,3 +6,7 @@ export { SizeLegendWidget } from './size-legend-widget';
 export { AnimationWidget } from './animation-widget';
 export { TimelineAnimationWidget } from './timeline-animation-widget';
 export { CameraPanelWidget } from './camera-panel-widget';
+
+// Not a layer/widget: installs window.__cam, the video camera that render_animation and the
+// Camera panel share.
+import './camera-path';

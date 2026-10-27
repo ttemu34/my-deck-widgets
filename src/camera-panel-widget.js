@@ -8,7 +8,7 @@
 // that the video refits the framing to its own size.
 //
 // Needs on the page:
-// - window.__cam: the camera helper (_CAM_HELPER), injected by the Python side.
+// - window.__cam: the video camera (camera-path.js, installed with this bundle).
 // - window.__tripsAnim / window.deckInstance: from TimelineAnimationWidget.
 // Page globals it publishes (TimelineAnimationWidget reads them):
 // - window.__camPanel: { toggle(), settings } -- the playback bar's camera button.
@@ -52,10 +52,10 @@ function createCameraPanel(CAMERAS) {
   const PREVIEW_FPS = 30;
   let views = null, lastView = null, panel = null, body = null, preview = false;
 
-  // A camera being edited: its type and every type's field values (so switching type and back
-  // keeps them).
+  // A camera being edited: its type, every type's field values (so switching type and back keeps
+  // them), and the keyframes camera's waypoints and the subject it follows without them.
   function newCamera(type) {
-    const cs = { type: type, values: {} };
+    const cs = { type: type, values: {}, keyframes: [], subject: '' };
     CAMERAS.forEach(function (c) {
       cs.values[c.type] = {};
       c.fields.forEach(function (f) {
@@ -68,6 +68,8 @@ function createCameraPanel(CAMERAS) {
 
   function camera(type) { return CAMERAS.find(function (c) { return c.type === type; }); }
   function camSpan() { return window.__cam.span() || window.__tripsAnim.span; }
+  function progress() { return Math.max(0, Math.min(1, window.__tripsAnim.time / camSpan())); }
+  function round(x, n) { const p = Math.pow(10, n); return Math.round(x * p) / p; }
   function currentView() {
     try {
       const v = window.deckInstance.getViewports()[0];
@@ -79,14 +81,39 @@ function createCameraPanel(CAMERAS) {
     const out = { type_: cs.type }, values = cs.values[cs.type];
     // Unset values are the defaults; leaving them out keeps optional limits from rejecting null.
     Object.keys(values).forEach(function (k) { if (values[k] != null) out[k] = values[k]; });
+    if (cs.type === 'keyframes') {
+      if (cs.keyframes.length) {
+        out.keyframes = cs.keyframes.map(function (k) {
+          return { t: round(k.t, 4), lon: round(k.lon, 6), lat: round(k.lat, 6),
+                   zoom: round(k.zoom, 2), pitch: round(k.pitch, 1), bearing: round(k.bearing, 1) };
+        });
+      } else {
+        out.source = { type_: 'subject', subject: cs.subject || null };
+      }
+    }
     return out;
   }
 
-  // Same shape as render_animation's _camera_opts.
+  // Same shape as render_animation's _camera_opts; keyframes resolved as _resolve_keyframes does
+  // for complete ones (sorted, bearings unwrapped for shortest turns).
   function pathOptions(cs, dims) {
     const s = settings(cs);
     const o = Object.assign({}, s, dims, { preset: s.type_ });
-    delete o.type_;
+    delete o.type_; delete o.source;
+    if (cs.type === 'keyframes') {
+      o.subject = cs.subject || null;
+      o.keyframes = null;
+      if (cs.keyframes.length >= 2) {
+        const K = cs.keyframes.slice().sort(function (a, b) { return a.t - b.t; }).map(function (k) {
+          return Object.assign({}, k);
+        });
+        for (let i = 1; i < K.length; i++) {
+          const d = ((K[i].bearing - K[i - 1].bearing + 180) % 360 + 360) % 360 - 180;
+          K[i].bearing = K[i - 1].bearing + d;
+        }
+        o.keyframes = K;
+      }
+    }
     return o;
   }
 
@@ -205,12 +232,55 @@ function createCameraPanel(CAMERAS) {
     return input;
   }
 
+  // The keyframes camera's waypoints: each is the map view at a moment of the clip.
+  function keyframeSection(parent, cs) {
+    const box = el('div', SECTION);
+    box.appendChild(el('div', 'font-weight:600;', 'Keyframes'));
+    box.appendChild(el('div', 'opacity:0.7;margin-top:2px;',
+      'Scrub to a moment, frame the map, then add it. With fewer than 2 keyframes the camera follows a subject.'));
+    const subject = el('input', INPUT);
+    subject.type = 'text'; subject.placeholder = 'longest-running track'; subject.value = cs.subject;
+    subject.addEventListener('change', function () { cs.subject = subject.value.trim(); invalidate(); });
+    row(box, 'Subject to follow', 'Value identifying the subject in any column (e.g. its name).', subject);
+    const add = el('div', 'margin-top:8px;');
+    button(add, '+ Add current view', 'Add a keyframe at the current time with the current view', function () {
+      const v = currentView();
+      if (!v) return;
+      cs.keyframes.push({ t: progress(), lon: v.longitude, lat: v.latitude, zoom: v.zoom, pitch: v.pitch || 0,
+                          bearing: v.bearing || 0 });
+      cs.keyframes.sort(function (a, b) { return a.t - b.t; });
+      invalidate(); render();
+    });
+    box.appendChild(add);
+    cs.keyframes.forEach(function (k, i) {
+      const r = el('div', 'display:flex;align-items:center;gap:6px;margin-top:6px;font-variant-numeric:tabular-nums;');
+      r.appendChild(el('span', 'flex:1;', (k.t * 100).toFixed(0) + '%  z' + k.zoom.toFixed(1) +
+        '  tilt ' + k.pitch.toFixed(0) + '°  hdg ' + k.bearing.toFixed(0) + '°'));
+      button(r, 'Go', 'Jump to this keyframe', function () {
+        window.__tripsAnim.renderAt(k.t * camSpan());
+        if (!preview) window.__tripsAnim.setView({ longitude: k.lon, latitude: k.lat, zoom: k.zoom,
+                                                  pitch: k.pitch, bearing: k.bearing });
+      });
+      button(r, 'Set', 'Replace with the current view (keeps its time)', function () {
+        const v = currentView();
+        if (!v) return;
+        Object.assign(k, { lon: v.longitude, lat: v.latitude, zoom: v.zoom, pitch: v.pitch || 0,
+                           bearing: v.bearing || 0 });
+        invalidate(); render();
+      });
+      button(r, '✕', 'Remove', function () { cs.keyframes.splice(i, 1); invalidate(); render(); });
+      box.appendChild(r);
+    });
+    parent.appendChild(box);
+  }
+
   function cameraForm(parent, cs) {
     row(parent, 'Camera', '', select(CAMERAS.map(function (c) { return [c.type, c.title]; }), cs.type,
                                      function (v) { cs.type = v; invalidate(); render(); }));
     const cam = camera(cs.type);
     parent.appendChild(el('div', 'opacity:0.7;margin-top:4px;', cam.description));
     cam.fields.forEach(function (f) { row(parent, f.title, f.description, fieldInput(f, cs.values[cs.type])); });
+    if (cs.type === 'keyframes') keyframeSection(parent, cs);
   }
 
   function copyText(text, done) {
