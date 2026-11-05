@@ -15,6 +15,7 @@ module.exports = {
   // Both entrypoints live on that single global, so both map to 'deck'.
   externals: {
     '@deck.gl/core': 'deck',
-    '@deck.gl/layers': 'deck'
+    '@deck.gl/layers': 'deck',
+    '@deck.gl/geo-layers': 'deck'
   }
 };

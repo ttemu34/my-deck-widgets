@@ -11,3 +11,5 @@ export { DrapedTileLayer } from './draped-tile-layer';
 // Not a layer/widget: installs window.__cam, the video camera that render_animation and the
 // Camera panel share.
 import './camera-path';
+export { ImageryGradeExtension } from './imagery-grade-extension';
+export { GradedTerrainLayer } from './graded-terrain-layer';

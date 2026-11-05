@@ -16,6 +16,7 @@
 import { CompositeLayer } from '@deck.gl/core';
 import { BitmapLayer } from '@deck.gl/layers';
 import { resolveDeckClass, getTerrainExtension, loadTerrainExtension } from './deck-modules';
+import { gradeExtension } from './imagery-grade-extension';
 
 // Esri's "Map data not yet available" tile: what ArcGIS Online basemaps return (HTTP 200) past the
 // deepest imagery for a place, e.g. zoom 19 almost everywhere in East African rangelands. Recognised
@@ -83,6 +84,8 @@ export class DrapedTileLayer extends CompositeLayer {
     const extension = this.state.extension;
     if (!TileLayer || !extension || !this.props.data) return null;
     const { data, minZoom, maxZoom, tileSize, opacity, maxRequests } = this.props;
+    const grade = gradeExtension(this.props.grade);
+    const extensions = grade ? [extension, grade] : [extension];
     return new TileLayer(this.getSubLayerProps({
       id: 'tiles',
       data: data,
@@ -102,7 +105,7 @@ export class DrapedTileLayer extends CompositeLayer {
           data: null,
           image: props.data,
           bounds: [box[0][0], box[0][1], box[1][0], box[1][1]],
-          extensions: [extension],
+          extensions: extensions,
           terrainDrawMode: 'drape'
         });
       }
@@ -119,5 +122,6 @@ DrapedTileLayer.defaultProps = {
   tileSize: 256,
   maxRequests: 6,
   zRange: null,   // [min, max] height in metres of the ground the tiles drape onto; null -> the view's lift
+  grade: null,    // colour grading for the tiles (ImageryGradeExtension), as GradedTerrainLayer's; null -> as served
   opacity: { type: 'number', min: 0, max: 1, value: 1 }
 };
