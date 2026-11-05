@@ -28,7 +28,7 @@
 
 import { Widget, WebMercatorViewport } from '@deck.gl/core';
 import { THEME_SURFACE } from './widget-theme';
-import { loadDeckModule } from './deck-modules';
+import { loadDeckModule, getTerrainExtension, loadTerrainExtension } from './deck-modules';
 
 export class TimelineAnimationWidget extends Widget {
   placement = 'bottom-left';
@@ -127,8 +127,13 @@ function createTimeline(deck, props) {
   // ScatterplotLayer draws the dot marker and the pulse ring
   const needsDot    = LAYER_SPECS.some(function (s) { return s.kind === 'trips' && s.head.kind !== 'none'; });
   const needsFilter = LAYER_SPECS.some(function (s) { return s.kind === 'window'; });
+  // Tracks in relative_to_mesh mode are drawn a set height above the rendered terrain
+  // (deck.gl TerrainExtension, 'offset'), not at the heights baked into their coordinates.
+  const needsMesh   = LAYER_SPECS.some(function (s) { return s.kind === 'trips' && s.meshHeight != null; });
   let __headReady   = !needsModel;
   let __filterReady = !needsFilter;
+  let __meshReady   = !needsMesh;
+  let TerrainExt    = null;
 
   // Resolve a deck.gl class without hard-coding the global namespace.
   function resolveLayer(name) {
@@ -858,14 +863,49 @@ function createTimeline(deck, props) {
     },
   };
 
+  // relative_to_mesh: one layer moved onto the rendered terrain. Its paths/positions keep their
+  // lon/lat and take z = the set height, which TerrainExtension ('offset') adds to the terrain's
+  // drawn height there. Until the extension loads, the layer stays at its baked heights
+  // (elevation data + the same height), so nothing is ever drawn underground. The new id makes
+  // deck build a fresh layer: an extension added to an existing one never gets set up.
+  const meshPaths = new WeakMap();   // trail row -> its path at the set height
+  function onMesh(layer, h) {
+    const p = layer.props;
+    const props = {
+      id: layer.id + '-mesh',
+      extensions: (p.extensions || []).concat([TerrainExt]),
+      terrainDrawMode: 'offset',
+    };
+    if (typeof p.getPath === 'function') {
+      const get = p.getPath;
+      props.getPath = function (d, info) {
+        let path = meshPaths.get(d);
+        if (!path) {
+          path = (get(d, info) || []).map(function (c) { return [c[0], c[1], h]; });
+          if (d && typeof d === 'object') meshPaths.set(d, path);
+        }
+        return path;
+      };
+    } else if (p.getPosition != null) {
+      const get = p.getPosition;
+      props.getPosition = function (d, info) {
+        const q = typeof get === 'function' ? get(d, info) : get;
+        return [q[0], q[1], h];
+      };
+    }
+    return layer.clone(props);
+  }
+
   function buildLayers() {
     const out = [], overlay = [];
     baseLayers.forEach(function (l) {
       const a = animatedById[l.id];
       if (!a) { out.push(l); return; }
       const built = a.animator.build(a.base, a.spec, a.state, currentTime);
-      out.push.apply(out, built.layers);
-      overlay.push.apply(overlay, built.overlay);
+      const h = a.spec.meshHeight;
+      const place = (h != null && TerrainExt) ? function (x) { return onMesh(x, h); } : null;
+      out.push.apply(out, place ? built.layers.map(place) : built.layers);
+      overlay.push.apply(overlay, place ? built.overlay.map(place) : built.overlay);
     });
     return out.concat(overlay);
   }
@@ -1507,6 +1547,16 @@ function createTimeline(deck, props) {
     if (needsFilter) {
       ensureDataFilter().then(function (C) { DataFilterCtor = C; __filterReady = true; redraw(); });
     }
+    if (needsMesh) {
+      TerrainExt = getTerrainExtension();
+      if (TerrainExt) __meshReady = true;
+      else {
+        loadTerrainExtension().then(
+          function (ext) { TerrainExt = ext; __meshReady = true; redraw(); },
+          function () { __meshReady = true; }   // stays at the baked heights
+        );
+      }
+    }
 
     if (CONTROLS.visible) buildControls();
     if (CONTROLS.show_hint && !headless) buildHint();
@@ -1531,8 +1581,8 @@ function createTimeline(deck, props) {
   // Lets a headless driver pause autoplay and paint an exact frame at time t.
   const bridge = {
     get ready()    { return !!animatedById; },
-    // Every lazily loaded piece (3D head model, DataFilterExtension) is in place.
-    get headReady() { return __headReady && __filterReady; },
+    // Every lazily loaded piece (3D head model, DataFilterExtension, TerrainExtension) is in place.
+    get headReady() { return __headReady && __filterReady && __meshReady; },
     get span()     { return maxTime; },
     get durationSec() { return durationSec; },
     get specs()    { return LAYER_SPECS; },  // animated layers (id, kind, window), for the exporter's camera

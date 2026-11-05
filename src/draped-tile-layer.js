@@ -15,7 +15,7 @@
 
 import { CompositeLayer } from '@deck.gl/core';
 import { BitmapLayer } from '@deck.gl/layers';
-import { loadDeckModule, resolveDeckClass } from './deck-modules';
+import { resolveDeckClass, getTerrainExtension, loadTerrainExtension } from './deck-modules';
 
 // Esri's "Map data not yet available" tile: what ArcGIS Online basemaps return (HTTP 200) past the
 // deepest imagery for a place, e.g. zoom 19 almost everywhere in East African rangelands. Recognised
@@ -44,33 +44,18 @@ async function loadTileImage(tile) {
   return createImageBitmap(new Blob([buffer]));
 }
 
-let terrainExtension = null;   // one shared TerrainExtension instance
-let terrainExtensionLoad = null;
-
-function loadTerrainExtension() {
-  if (!terrainExtensionLoad) {
-    terrainExtensionLoad = loadDeckModule('@deck.gl/extensions').then(function (mod) {
-      const Ext = mod && (mod.TerrainExtension || mod._TerrainExtension);
-      if (!Ext) throw new Error('@deck.gl/extensions has no TerrainExtension');
-      terrainExtension = new Ext();
-      return terrainExtension;
-    });
-    terrainExtensionLoad.catch(function (e) {
-      console.warn('[DrapedTileLayer] could not load TerrainExtension; draped tiles are not drawn.', e);
-    });
-  }
-  return terrainExtensionLoad;
-}
-
 export class DrapedTileLayer extends CompositeLayer {
   initializeState() {
-    this.state = { extension: terrainExtension };
-    if (terrainExtension) return;
+    const ready = getTerrainExtension();
+    this.state = { extension: ready };
+    if (ready) return;
     const self = this;
     loadTerrainExtension().then(function (ext) {
       // State is shared with this layer's later instances, so this re-renders the current one.
       if (self.internalState) self.setState({ extension: ext });
-    }, function () {});
+    }, function () {
+      console.warn('[DrapedTileLayer] no TerrainExtension; draped tiles are not drawn.');
+    });
   }
 
   // Re-render on view changes too, so the culling height follows the view's lift.

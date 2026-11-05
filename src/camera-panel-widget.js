@@ -44,6 +44,12 @@ export class CameraPanelWidget extends Widget {
   onRenderHTML(rootElement) {
     // Shown only while the panel is open, so the closed panel takes no room in the corner.
     rootElement.style.display = this._panel && this._panel.isOpen() ? '' : 'none';
+    // Out of the corner's flow: deck stacks a corner's widgets in one container, so the open
+    // 300px panel would widen it and drag the fullscreen/loading buttons towards the middle of
+    // the map. Overlaid just left of those buttons instead, the corner keeps its size.
+    Object.assign(rootElement.style, {
+      position: 'absolute', top: '0', right: '100%', marginRight: '4px', zIndex: '2',
+    });
   }
 }
 
@@ -161,13 +167,15 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
     }
     const v = views[Math.round(Math.max(0, Math.min(1, t / camSpan())) * (views.length - 1))];
     if (!v) return;
-    lastView = v;
-    window.deckInstance.setProps({ viewState: Object.assign({}, v) });
+    lastView = window.__cam.deckView(v);
+    window.__cam.caption(v.caption, v.captionOpacity);
+    window.deckInstance.setProps({ viewState: Object.assign({}, lastView) });
   };
   function setPreview(on) {
     preview = on;
     window.__camPreviewOn = on;
     if (on) { invalidate(); return; }
+    window.__cam.caption(null);
     window.__tripsAnim.setView(lastView || currentView());
   }
 
@@ -204,7 +212,7 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
   // Inside the widget's deck.gl container (top-right corner, stacked with deck's own buttons), in
   // deck.gl's widget theme. color-scheme: dark makes the browser draw native parts (a select's
   // option list) dark too, instead of white text on a white list.
-  const CSS = 'width:300px;max-height:calc(100vh - 220px);overflow:auto;padding:10px 12px;' +
+  const CSS = 'width:300px;max-width:calc(100vw - 80px);max-height:calc(100vh - 220px);overflow:auto;padding:10px 12px;' +
     'box-sizing:border-box;color-scheme:dark;pointer-events:auto;' + MENU_SURFACE +
     'font:12px/1.35 system-ui,sans-serif;';
   const INPUT = 'width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;' +
@@ -402,10 +410,10 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
     actions.appendChild(pl);
     const btns = el('div', 'display:flex;gap:6px;align-items:center;margin-top:8px;');
     const note = el('span', 'opacity:0.75;');
-    button(btns, 'Copy settings', "Copy, then paste into the workflow's Video Camera settings", function () {
+    button(btns, 'Copy settings', "Copy, then paste into the workflow's Camera settings", function () {
       copyText(JSON.stringify(settings(root)), function () { note.textContent = 'Copied'; });
     });
-    button(btns, 'Download', "Save as a file to upload as the workflow's Video Camera settings", function () {
+    button(btns, 'Download', "Save as a file to upload as the workflow's Camera settings", function () {
       const a = el('a');
       a.href = URL.createObjectURL(new Blob([JSON.stringify(settings(root), null, 2)], { type: 'application/json' }));
       a.download = 'camera-settings.json';
@@ -415,7 +423,7 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
     btns.appendChild(note);
     actions.appendChild(btns);
     actions.appendChild(el('div', 'opacity:0.7;margin-top:6px;',
-      "Paste these into the workflow's Video Camera settings and re-run: the map's preview and the video " +
+      "Paste these into the workflow's Camera settings and re-run: the map's preview and the video " +
       'both use them. The video refits the framing to its own size, so it can differ slightly from this window.'));
     body.appendChild(actions);
     panel.scrollTop = scroll;

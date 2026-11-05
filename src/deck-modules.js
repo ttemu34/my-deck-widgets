@@ -44,3 +44,27 @@ export function resolveDeckClass(name) {
   }
   return null;
 }
+
+// One shared TerrainExtension instance (from @deck.gl/extensions), for everything drawn onto the
+// TerrainLayer's rendered surface: draped tiles ('drape') and tracks placed above it ('offset').
+// deck keys an extension's shader modules by instance, so sharing one keeps them compiled once.
+let terrainExtension = null;
+let terrainExtensionLoad = null;
+
+export function getTerrainExtension() { return terrainExtension; }
+
+export function loadTerrainExtension() {
+  if (!terrainExtensionLoad) {
+    terrainExtensionLoad = loadDeckModule('@deck.gl/extensions').then(function (mod) {
+      const Ext = mod && (mod.TerrainExtension || mod._TerrainExtension);
+      if (!Ext) throw new Error('@deck.gl/extensions has no TerrainExtension');
+      terrainExtension = new Ext();
+      return terrainExtension;
+    });
+    terrainExtensionLoad.catch(function (e) {
+      terrainExtensionLoad = null;   // a failed load can be retried
+      console.warn('[my-deck-widgets] could not load TerrainExtension.', e);
+    });
+  }
+  return terrainExtensionLoad;
+}
