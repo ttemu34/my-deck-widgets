@@ -27,6 +27,8 @@
 // panel (CameraPanelWidget) is on the page.
 
 import { Widget, WebMercatorViewport } from '@deck.gl/core';
+import { THEME_SURFACE } from './widget-theme';
+import { loadDeckModule } from './deck-modules';
 
 export class TimelineAnimationWidget extends Widget {
   placement = 'bottom-left';
@@ -151,26 +153,8 @@ function createTimeline(deck, props) {
     });
   }
 
-  // deck.gl's standalone module bundles replace window.deck with only their own exports,
-  // so load them one at a time, hand back the module, and restore the full namespace.
-  // Loaded from unpkg at the page's deck.gl version rather than bundled here: a bundled
-  // copy could drift from the deck.gl that pydeck loads.
-  let _moduleChain = Promise.resolve();
-  function loadDeckModule(pkg) {
-    const run = async function () {
-      const prev = window.deck;
-      const ver = (prev && prev.VERSION) || 'latest';
-      try {
-        await loadScript('https://unpkg.com/' + pkg + '@' + ver + '/dist.min.js');
-        return window.deck;
-      } finally {
-        window.deck = prev;
-      }
-    };
-    const p = _moduleChain.then(run, run);
-    _moduleChain = p.catch(function () {});
-    return p;
-  }
+  // deck.gl modules pydeck's page lacks come from loadDeckModule (deck-modules.js), shared with the
+  // rest of this library.
 
   async function ensureScenegraph() {
     const found = resolveLayer('ScenegraphLayer');
@@ -1049,6 +1033,7 @@ function createTimeline(deck, props) {
   // Hand the camera back to the viewer at `view`, e.g. when the Camera panel's preview ends.
   function releaseCamera(view) {
     if (!view) return;
+    view = withGround(view);
     if (autoRotateSpeed !== 0) {
       _deckViewState = Object.assign({}, view);
       rotateBearing  = view.bearing || 0;
@@ -1133,8 +1118,8 @@ function createTimeline(deck, props) {
     // Bottom: above the corner widgets (scale bar left, legend right). Top: below the title.
     const edge = CONTROLS.position === 'top' ? 'top:56px;' : 'bottom:72px;';
     root.style.cssText = 'position:absolute;left:50%;' + edge + 'transform:translateX(-50%);z-index:10;' +
-      'display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;' +
-      'background:rgba(20,20,20,0.72);color:#fff;font:12px/1.2 system-ui,sans-serif;' +
+      'display:flex;align-items:center;gap:8px;padding:6px 10px;' + THEME_SURFACE +
+      'font:12px/1.2 system-ui,sans-serif;' +
       'max-width:min(640px,calc(100% - 32px));box-sizing:border-box;';
     if (CONTROLS.show_scrubber) root.style.width = 'min(640px,calc(100% - 32px))';
     function button(text, title, onClick) {
@@ -1220,8 +1205,8 @@ function createTimeline(deck, props) {
     // Just clear of the playback bar, on whichever edge it sits.
     const edge = CONTROLS.position === 'top' ? 'top:100px;' : 'bottom:116px;';
     hintEl.style.cssText = 'position:absolute;left:50%;' + edge + 'transform:translateX(-50%);z-index:10;' +
-      'display:flex;align-items:center;gap:8px;padding:5px 6px 5px 10px;border-radius:8px;' +
-      'background:rgba(20,20,20,0.72);color:#fff;font:12px/1.3 system-ui,sans-serif;' +
+      'display:flex;align-items:center;gap:8px;padding:5px 6px 5px 10px;' + THEME_SURFACE +
+      'font:12px/1.3 system-ui,sans-serif;' +
       'max-width:calc(100% - 32px);box-sizing:border-box;transition:opacity .4s;';
     const span = document.createElement('span');
     span.textContent = text;
@@ -1355,6 +1340,49 @@ function createTimeline(deck, props) {
     deck.setProps({ initialViewState: Object.assign({}, ivs, v) });
   }
 
+  // deck's MapView orbits a point at sea level, so over high ground (e.g. ~1,700 m in central Kenya)
+  // zooming in and tilting puts the camera under the terrain: the terrain is culled and the page
+  // background shows through as a blank (white) map. Lift the look-at point to the tracks' mean
+  // height (they are draped on the terrain), as the video camera does per frame (camera-path.js).
+  let groundLift = 0;
+  function measureGround() {
+    let sum = 0, n = 0;
+    Object.keys(animatedById).forEach(function (id) {
+      const st = animatedById[id].state;
+      ((st && st.tracks) || []).forEach(function (tr) {
+        (tr ? tr.C : []).forEach(function (p) { if (p.length > 2 && isFinite(p[2])) { sum += p[2]; n++; } });
+      });
+    });
+    groundLift = n ? sum / n : 0;
+  }
+  function withGround(view) {
+    if (!view || !groundLift || view.position) return view;
+    return Object.assign({}, view, { position: [0, 0, groundLift] });
+  }
+  // deck.gl's ResetViewWidget goes back to deck's initialViewState unless given its own. This widget
+  // rewrites initialViewState whenever it hands the camera back to the viewer (releaseCamera: the
+  // Camera panel's preview ending, the exporter's setView), so "reset" would go to wherever the map
+  // already is. Give the button the opening view, as framed and lifted above. It also needs the view's
+  // id: without one it addresses a view called 'default-view', and pydeck's map view is 'MapView', so
+  // the reset went nowhere. With an id it reads the view state keyed by it.
+  function pinResetView() {
+    const ivs = deck.props.initialViewState;
+    if (!ivs) return;
+    let viewId = null;
+    try { viewId = deck.getViewports()[0].id; } catch (e) { /* not laid out yet */ }
+    (deck.props.widgets || []).forEach(function (w) {   // id set by draw_animated_map
+      if (!w || w.id !== 'ResetViewWidget') return;
+      const view = Object.assign({}, ivs);
+      w.setProps(viewId ? { viewId: viewId, initialViewState: { [viewId]: view } } : { initialViewState: view });
+    });
+  }
+
+  function liftToGround() {
+    measureGround();
+    const ivs = deck.props.initialViewState;
+    if (ivs && groundLift) deck.setProps({ initialViewState: withGround(ivs) });
+  }
+
   // --- Waiting for the map before autoplay ------------------------------------------
   // The base map (Mapbox/Carto style under deck, if any), every deck layer (terrain and tile
   // layers report isLoaded once the tiles in view are in) and a quiet network for QUIET_MS.
@@ -1377,7 +1405,9 @@ function createTimeline(deck, props) {
     try {
       const host = window.deckInstance || deck;
       const map = host.getMapboxMap ? host.getMapboxMap() : null;
-      if (!map) return true;
+      // No base map, or one without a style (map_style=None, e.g. over a 3D terrain): MapLibre's
+      // loaded() never turns true for a style-less map, so there is nothing to wait for.
+      if (!map || !map.style) return true;
       return map.loaded() && (!map.areTilesLoaded || map.areTilesLoaded());
     } catch (e) { return true; }
   }
@@ -1404,6 +1434,8 @@ function createTimeline(deck, props) {
     });
     buildPacing();
     fitToTracks();
+    liftToGround();
+    pinResetView();
     // 3D-model animations read deck's own Timeline; the exporter sets it to the playback time.
     deckTimeline = (deck.animationLoop && deck.animationLoop.timeline) || null;
 

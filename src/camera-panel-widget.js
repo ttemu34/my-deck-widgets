@@ -18,6 +18,7 @@
 // overlay (#camera-panel), opened from the playback bar.
 
 import { Widget } from '@deck.gl/core';
+import { THEME_SURFACE, MENU_SURFACE } from './widget-theme';
 
 export class CameraPanelWidget extends Widget {
   placement = 'top-right';
@@ -29,7 +30,10 @@ export class CameraPanelWidget extends Widget {
   }
 
   onAdd() {
-    this._panel = createCameraPanel(this.props.cameras, this.props);
+    // The panel opens inside this widget's own root (a deck.gl widget container, top-right),
+    // created by deck after onAdd, so it is looked up when the panel first opens.
+    const self = this;
+    this._panel = createCameraPanel(this.props.cameras, this.props, function () { return self.rootElement; });
   }
 
   onRemove() {
@@ -38,7 +42,8 @@ export class CameraPanelWidget extends Widget {
   }
 
   onRenderHTML(rootElement) {
-    rootElement.style.display = 'none';
+    // Shown only while the panel is open, so the closed panel takes no room in the corner.
+    rootElement.style.display = this._panel && this._panel.isOpen() ? '' : 'none';
   }
 }
 
@@ -50,7 +55,7 @@ CameraPanelWidget.defaultProps = {
   preview: false  // start with the preview on, so playing shows the video's camera
 };
 
-function createCameraPanel(CAMERAS, opts) {
+function createCameraPanel(CAMERAS, opts, getRoot) {
   const PREVIEW_FPS = 30;
   // The video exporter drives the view itself, so the preview never runs headless.
   const headless = typeof navigator !== 'undefined' && !!navigator.webdriver;
@@ -172,8 +177,8 @@ function createCameraPanel(CAMERAS, opts) {
   function toast(text) {
     if (!toastEl) {
       toastEl = el('div', 'position:absolute;left:50%;top:12px;transform:translateX(-50%);z-index:12;' +
-        'padding:6px 10px;border-radius:8px;background:rgba(20,20,20,0.85);color:#fff;' +
-        'font:12px/1.35 system-ui,sans-serif;pointer-events:none;transition:opacity .4s;max-width:calc(100% - 32px);');
+        'padding:6px 10px;' + THEME_SURFACE + 'font:12px/1.35 system-ui,sans-serif;pointer-events:none;' +
+        'transition:opacity .4s;max-width:calc(100% - 32px);');
       toastEl.id = 'camera-toast';
       document.body.appendChild(toastEl);
     }
@@ -182,8 +187,12 @@ function createCameraPanel(CAMERAS, opts) {
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { toastEl.style.opacity = '0'; }, 4000);
   }
+  // The map itself, or deck.gl's own map buttons (zoom, compass, reset view).
+  const STEER_BUTTONS = '.deck-widget-zoom, .deck-widget-compass, .deck-widget-reset-view, .deck-widget-gimbal';
   function onUserSteer(e) {
-    if (!preview || !e.target || e.target.tagName !== 'CANVAS') return;
+    const t = e.target;
+    if (!preview || !t) return;
+    if (t.tagName !== 'CANVAS' && !(e.type === 'pointerdown' && t.closest && t.closest(STEER_BUTTONS))) return;
     setPreview(false);
     if (panel) render();
     toast('Camera preview off while you move the map. Turn it back on in the Video camera panel.');
@@ -192,15 +201,16 @@ function createCameraPanel(CAMERAS, opts) {
   document.addEventListener('wheel', onUserSteer, { capture: true, passive: true });
 
   // --- Panel UI ----------------------------------------------------------------------------
-  // color-scheme: dark makes the browser draw native parts (a select's option list) dark too,
-  // instead of white text on a white list.
-  const CSS = 'position:absolute;top:56px;right:12px;z-index:11;width:300px;max-height:calc(100% - 170px);' +
-    'overflow:auto;padding:10px 12px;border-radius:8px;box-sizing:border-box;color-scheme:dark;' +
-    'background:rgba(20,20,20,0.85);color:#fff;font:12px/1.35 system-ui,sans-serif;';
+  // Inside the widget's deck.gl container (top-right corner, stacked with deck's own buttons), in
+  // deck.gl's widget theme. color-scheme: dark makes the browser draw native parts (a select's
+  // option list) dark too, instead of white text on a white list.
+  const CSS = 'width:300px;max-height:calc(100vh - 220px);overflow:auto;padding:10px 12px;' +
+    'box-sizing:border-box;color-scheme:dark;pointer-events:auto;' + MENU_SURFACE +
+    'font:12px/1.35 system-ui,sans-serif;';
   const INPUT = 'width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;' +
-    'border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.08);color:#fff;font:inherit;';
+    'border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.08);color:inherit;font:inherit;';
   const BUTTON = 'padding:4px 8px;border-radius:4px;border:1px solid rgba(255,255,255,0.35);' +
-    'background:rgba(255,255,255,0.1);color:#fff;font:inherit;cursor:pointer;';
+    'background:rgba(255,255,255,0.1);color:inherit;font:inherit;cursor:pointer;';
   const SECTION = 'margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.2);';
 
   function el(tag, css, text) {
@@ -417,21 +427,29 @@ function createCameraPanel(CAMERAS, opts) {
     panel.hidden = true;
     const head = el('div', 'display:flex;align-items:center;font-weight:600;font-size:13px;');
     head.appendChild(el('span', 'flex:1;', 'Video camera'));
-    const close = button(head, '✕', 'Close', function () { panel.hidden = true; });
-    close.style.cssText = 'background:none;border:0;color:#fff;cursor:pointer;font-size:14px;';
+    const close = button(head, '✕', 'Close', function () { setOpen(false); });
+    close.style.cssText = 'background:none;border:0;color:inherit;cursor:pointer;font-size:14px;';
     panel.appendChild(head);
     body = el('div');
     panel.appendChild(body);
-    document.body.appendChild(panel);
+    (getRoot && getRoot() || document.body).appendChild(panel);
     render();
   }
 
+  function setOpen(open) {
+    if (!panel) build();
+    panel.hidden = !open;
+    const host = getRoot && getRoot();
+    if (host) host.style.display = open ? '' : 'none';
+  }
+
   window.__camPanel = {
-    toggle: function () { if (!panel) build(); panel.hidden = !panel.hidden; },
+    toggle: function () { setOpen(!panel || panel.hidden); },
     get settings() { return settings(root); },
   };
 
   return {
+    isOpen: function () { return !!panel && !panel.hidden; },
     destroy: function () {
       if (preview) setPreview(false);
       document.removeEventListener('pointerdown', onUserSteer, true);
