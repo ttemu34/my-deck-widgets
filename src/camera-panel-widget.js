@@ -29,7 +29,7 @@ export class CameraPanelWidget extends Widget {
   }
 
   onAdd() {
-    this._panel = createCameraPanel(this.props.cameras);
+    this._panel = createCameraPanel(this.props.cameras, this.props);
   }
 
   onRemove() {
@@ -45,12 +45,18 @@ export class CameraPanelWidget extends Widget {
 CameraPanelWidget.defaultProps = {
   ...Widget.defaultProps,
   id: 'camera-panel',
-  cameras: []   // camera_panel_schema(): [{ type, title, description, fields: [...] }]
+  cameras: [],    // camera_panel_schema(): [{ type, title, description, fields: [...] }]
+  initial: null,  // the workflow's camera, as render_animation takes it (camera_panel_initial()); null -> first camera
+  preview: false  // start with the preview on, so playing shows the video's camera
 };
 
-function createCameraPanel(CAMERAS) {
+function createCameraPanel(CAMERAS, opts) {
   const PREVIEW_FPS = 30;
-  let views = null, lastView = null, panel = null, body = null, preview = false;
+  // The video exporter drives the view itself, so the preview never runs headless.
+  const headless = typeof navigator !== 'undefined' && !!navigator.webdriver;
+  let views = null, lastView = null, panel = null, body = null;
+  let preview = !!(opts && opts.preview) && !headless;
+  window.__camPreviewOn = preview;
 
   // A camera being edited: its type, every type's field values (so switching type and back keeps
   // them), and the keyframes camera's waypoints and the subject it follows without them.
@@ -64,9 +70,27 @@ function createCameraPanel(CAMERAS) {
     });
     return cs;
   }
-  const root = newCamera(CAMERAS[0].type);
-
   function camera(type) { return CAMERAS.find(function (c) { return c.type === type; }); }
+
+  // Open on the workflow's camera (the same settings object the panel copies), so the preview
+  // matches the video. Keyframe channels the workflow left blank take the map's opening view.
+  function applyInitial(cs, s) {
+    if (!s || !camera(s.type_)) return;
+    cs.type = s.type_;
+    const values = cs.values[cs.type];
+    Object.keys(values).forEach(function (k) { if (k in s) values[k] = s[k]; });
+    if (cs.type !== 'keyframes') return;
+    const ivs = (window.jsonInput && window.jsonInput.initialViewState) || {};
+    cs.keyframes = (s.keyframes || []).map(function (k) {
+      return { t: k.t, lon: k.lon, lat: k.lat,
+               zoom: k.zoom != null ? k.zoom : (ivs.zoom || 0),
+               pitch: k.pitch != null ? k.pitch : (ivs.pitch || 0),
+               bearing: k.bearing != null ? k.bearing : (ivs.bearing || 0) };
+    });
+    cs.subject = (s.source && s.source.subject) || '';
+  }
+  const root = newCamera(CAMERAS[0].type);
+  applyInitial(root, opts && opts.initial);
   function camSpan() { return window.__cam.span() || window.__tripsAnim.span; }
   function progress() { return Math.max(0, Math.min(1, window.__tripsAnim.time / camSpan())); }
   function round(x, n) { const p = Math.pow(10, n); return Math.round(x * p) / p; }
@@ -142,9 +166,36 @@ function createCameraPanel(CAMERAS) {
     window.__tripsAnim.setView(lastView || currentView());
   }
 
+  // Grabbing the map while the preview runs hands the view back to the viewer (the preview would
+  // otherwise snap it back every frame), with a note on how to turn the preview on again.
+  let toastEl = null, toastTimer = null;
+  function toast(text) {
+    if (!toastEl) {
+      toastEl = el('div', 'position:absolute;left:50%;top:12px;transform:translateX(-50%);z-index:12;' +
+        'padding:6px 10px;border-radius:8px;background:rgba(20,20,20,0.85);color:#fff;' +
+        'font:12px/1.35 system-ui,sans-serif;pointer-events:none;transition:opacity .4s;max-width:calc(100% - 32px);');
+      toastEl.id = 'camera-toast';
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = text;
+    toastEl.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.style.opacity = '0'; }, 4000);
+  }
+  function onUserSteer(e) {
+    if (!preview || !e.target || e.target.tagName !== 'CANVAS') return;
+    setPreview(false);
+    if (panel) render();
+    toast('Camera preview off while you move the map. Turn it back on in the Video camera panel.');
+  }
+  document.addEventListener('pointerdown', onUserSteer, true);
+  document.addEventListener('wheel', onUserSteer, { capture: true, passive: true });
+
   // --- Panel UI ----------------------------------------------------------------------------
+  // color-scheme: dark makes the browser draw native parts (a select's option list) dark too,
+  // instead of white text on a white list.
   const CSS = 'position:absolute;top:56px;right:12px;z-index:11;width:300px;max-height:calc(100% - 170px);' +
-    'overflow:auto;padding:10px 12px;border-radius:8px;box-sizing:border-box;' +
+    'overflow:auto;padding:10px 12px;border-radius:8px;box-sizing:border-box;color-scheme:dark;' +
     'background:rgba(20,20,20,0.85);color:#fff;font:12px/1.35 system-ui,sans-serif;';
   const INPUT = 'width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;' +
     'border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.08);color:#fff;font:inherit;';
@@ -175,7 +226,10 @@ function createCameraPanel(CAMERAS) {
   }
   function select(options, value, onChange) {   // options: [[value, label], ...]
     const s = el('select', INPUT);
-    options.forEach(function (o) { const opt = el('option', '', o[1]); opt.value = o[0]; s.appendChild(opt); });
+    options.forEach(function (o) {
+      const opt = el('option', 'background:#202020;color:#fff;', o[1]);
+      opt.value = o[0]; s.appendChild(opt);
+    });
     s.value = value == null ? '' : value;
     s.addEventListener('change', function () { onChange(s.value); });
     return s;
@@ -279,8 +333,39 @@ function createCameraPanel(CAMERAS) {
                                      function (v) { cs.type = v; invalidate(); render(); }));
     const cam = camera(cs.type);
     parent.appendChild(el('div', 'opacity:0.7;margin-top:4px;', cam.description));
+    if (cam.fields.some(function (f) { return f.name in VIEW_FIELDS; })) {
+      const b = el('div', 'margin-top:8px;');
+      button(b, 'Use current view', "Fill the camera's center, range, tilt and heading from the map as it is now",
+             function () { useCurrentView(cs); });
+      parent.appendChild(b);
+    }
     cam.fields.forEach(function (f) { row(parent, f.title, f.description, fieldInput(f, cs.values[cs.type])); });
     if (cs.type === 'keyframes') keyframeSection(parent, cs);
+  }
+
+  // The map's view as the camera fields this camera has (Google Maps 3D terms: center, range in
+  // metres, tilt, heading), so Copy settings captures what is on screen.
+  const VIEW_FIELDS = { lon: 1, lat: 1, range_m: 1, tilt: 1, heading: 1 };
+  function useCurrentView(cs) {
+    const v = currentView();
+    if (!v) return;
+    const values = cs.values[cs.type];
+    const canvas = document.querySelector('#deck-container canvas');
+    const height = canvas ? canvas.clientHeight : 720;
+    const heading = (((v.bearing || 0) + 180) % 360 + 360) % 360 - 180;
+    const from = {
+      lon: round(v.longitude, 6), lat: round(v.latitude, 6),
+      range_m: Math.round(window.__cam.rangeForZoom(v.zoom, v.latitude, height, values.fov)),
+      tilt: round(v.pitch || 0, 1), heading: round(heading, 1)
+    };
+    camera(cs.type).fields.forEach(function (f) {
+      if (!(f.name in from)) return;
+      let x = from[f.name];
+      if (f.min != null) x = Math.max(f.min, x);
+      if (f.max != null) x = Math.min(f.max, x);
+      values[f.name] = x;
+    });
+    invalidate(); render();
   }
 
   function copyText(text, done) {
@@ -307,10 +392,10 @@ function createCameraPanel(CAMERAS) {
     actions.appendChild(pl);
     const btns = el('div', 'display:flex;gap:6px;align-items:center;margin-top:8px;');
     const note = el('span', 'opacity:0.75;');
-    button(btns, 'Copy settings', "Copy, then paste into render_animation's Camera settings", function () {
+    button(btns, 'Copy settings', "Copy, then paste into the workflow's Video Camera settings", function () {
       copyText(JSON.stringify(settings(root)), function () { note.textContent = 'Copied'; });
     });
-    button(btns, 'Download', "Save as a file to upload as render_animation's Camera settings", function () {
+    button(btns, 'Download', "Save as a file to upload as the workflow's Video Camera settings", function () {
       const a = el('a');
       a.href = URL.createObjectURL(new Blob([JSON.stringify(settings(root), null, 2)], { type: 'application/json' }));
       a.download = 'camera-settings.json';
@@ -320,8 +405,8 @@ function createCameraPanel(CAMERAS) {
     btns.appendChild(note);
     actions.appendChild(btns);
     actions.appendChild(el('div', 'opacity:0.7;margin-top:6px;',
-      "Use these settings in the workflow's render step (Camera settings). The video refits the framing " +
-      'to its own size, so it can differ slightly from this window.'));
+      "Paste these into the workflow's Video Camera settings and re-run: the map's preview and the video " +
+      'both use them. The video refits the framing to its own size, so it can differ slightly from this window.'));
     body.appendChild(actions);
     panel.scrollTop = scroll;
   }
@@ -349,6 +434,10 @@ function createCameraPanel(CAMERAS) {
   return {
     destroy: function () {
       if (preview) setPreview(false);
+      document.removeEventListener('pointerdown', onUserSteer, true);
+      document.removeEventListener('wheel', onUserSteer, { capture: true });
+      clearTimeout(toastTimer);
+      if (toastEl) toastEl.remove();
       if (panel) panel.remove();
       delete window.__camPanel;
       delete window.__camPreview;

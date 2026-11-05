@@ -1190,6 +1190,50 @@ function createTimeline(deck, props) {
     updateControls();
   }
 
+  // ---------------------------------------------------------------------------
+  // How to move the map, shown until dismissed (remembered in this browser) or until the viewer
+  // rotates or tilts it. deck's MapController rotates on a drag with Shift/Ctrl/Cmd/Alt held,
+  // or with the right button.
+  // ---------------------------------------------------------------------------
+  const HINT_KEY = 'myDeckWidgets.mapHintDismissed';
+  let hintEl = null;
+  function hideHint(remember) {
+    if (!hintEl) return;
+    if (remember) { try { localStorage.setItem(HINT_KEY, '1'); } catch (e) { /* storage blocked */ } }
+    hintEl.style.opacity = '0';
+    const h = hintEl; hintEl = null;
+    setTimeout(function () { h.remove(); }, 400);
+    document.removeEventListener('pointerdown', onHintPointer, true);
+  }
+  function onHintPointer(e) {
+    if (e.target && e.target.tagName === 'CANVAS' &&
+        (e.button === 2 || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey)) hideHint(true);
+  }
+  function buildHint() {
+    try { if (localStorage.getItem(HINT_KEY)) return; } catch (e) { /* storage blocked: show it */ }
+    const touch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    const text = touch
+      ? 'Drag to pan · Pinch to zoom · Two-finger drag to rotate and tilt'
+      : 'Drag to pan · Shift + drag (or right-drag) to rotate and tilt · Scroll to zoom';
+    hintEl = document.createElement('div');
+    hintEl.id = 'map-hint';
+    // Just clear of the playback bar, on whichever edge it sits.
+    const edge = CONTROLS.position === 'top' ? 'top:100px;' : 'bottom:116px;';
+    hintEl.style.cssText = 'position:absolute;left:50%;' + edge + 'transform:translateX(-50%);z-index:10;' +
+      'display:flex;align-items:center;gap:8px;padding:5px 6px 5px 10px;border-radius:8px;' +
+      'background:rgba(20,20,20,0.72);color:#fff;font:12px/1.3 system-ui,sans-serif;' +
+      'max-width:calc(100% - 32px);box-sizing:border-box;transition:opacity .4s;';
+    const span = document.createElement('span');
+    span.textContent = text;
+    const close = document.createElement('button');
+    close.type = 'button'; close.textContent = '✕'; close.title = "Don't show again";
+    close.style.cssText = 'background:none;border:0;color:inherit;cursor:pointer;font-size:12px;padding:0 4px;';
+    close.addEventListener('click', function () { hideHint(true); });
+    hintEl.appendChild(span); hintEl.appendChild(close);
+    document.body.appendChild(hintEl);
+    document.addEventListener('pointerdown', onHintPointer, true);
+  }
+
   function frame(timestamp) {
     if (!isPlaying || destroyed) return;
 
@@ -1433,6 +1477,7 @@ function createTimeline(deck, props) {
     }
 
     if (CONTROLS.visible) buildControls();
+    if (CONTROLS.show_hint && !headless) buildHint();
     redraw();
     // Autoplay once the map has loaded, so playback doesn't run over a half-drawn base map.
     waitForMap(function () {
@@ -1493,6 +1538,8 @@ function createTimeline(deck, props) {
       clearInterval(startTimer);
       if (resourceObserver) resourceObserver.disconnect();
       document.removeEventListener('keydown', onEscape);
+      document.removeEventListener('pointerdown', onHintPointer, true);
+      if (hintEl) hintEl.remove();
       if (controls) controls.root.remove();
       controls = null;
       if (window.__tripsAnim === bridge) delete window.__tripsAnim;

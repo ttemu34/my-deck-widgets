@@ -190,6 +190,11 @@ export function createCameraPath() {
     var altitude = fov ? 0.5 / Math.tan(fov * Math.PI / 360) : 1.5;
     return Math.log2(altitude * height * EARTH_M * Math.cos(lat * Math.PI / 180) / (512 * rangeM));
   }
+  // The inverse: the range a deck zoom stands for (the Camera panel's "Use current view").
+  function rangeForZoom(zoom, lat, height, fov) {
+    var altitude = fov ? 0.5 / Math.tan(fov * Math.PI / 360) : 1.5;
+    return altitude * height * EARTH_M * Math.cos(lat * Math.PI / 180) / (512 * Math.pow(2, zoom));
+  }
   function copies(v, n) { var out = []; for (var i = 0; i < n; i++) out.push(Object.assign({}, v)); return out; }
 
   function flyer() { var FTI = (window.deck || {}).FlyToInterpolator; return FTI ? new FTI({ curve: 1.414 }) : null; }
@@ -409,7 +414,7 @@ export function createCameraPath() {
     return applyLens(out, o);
   }
 
-  return { span: span, initialView: initialView, path: path };
+  return { span: span, initialView: initialView, path: path, rangeForZoom: rangeForZoom };
 }
 
 if (typeof window !== 'undefined') window.__cam = createCameraPath();
