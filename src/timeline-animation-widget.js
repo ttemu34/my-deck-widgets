@@ -150,13 +150,20 @@ function createTimeline(deck, props) {
     return null;
   }
 
-  function loadScript(src) {
+  function loadScript(src, integrity) {
     return new Promise(function (resolve, reject) {
       const s = document.createElement('script');
+      if (integrity) { s.integrity = integrity; s.crossOrigin = 'anonymous'; }
       s.src = src; s.onload = resolve; s.onerror = reject;
       document.head.appendChild(s);
     });
   }
+
+  // glTF loader for the 3D heads: an exact version (deck.gl 9.2, which pydeck 0.9.x loads, is built
+  // against loaders.gl ~4.3.4) with a Subresource Integrity hash, so the browser refuses any other
+  // bytes. The hash is of the published npm tarball's dist/dist.min.js, which unpkg serves verbatim.
+  const GLTF_LOADER_URL = 'https://unpkg.com/@loaders.gl/gltf@4.3.4/dist/dist.min.js';
+  const GLTF_LOADER_SRI = 'sha384-AoECOmcEqTf9aAjlRVJ9lieWaf/LXGMmGuY5EFnd/texHbJniDALU8+DHo6zI/wG';
 
   // deck.gl modules pydeck's page lacks come from loadDeckModule (deck-modules.js), shared with the
   // rest of this library.
@@ -166,7 +173,7 @@ function createTimeline(deck, props) {
     if (found) return found;
     try {
       const mod = await loadDeckModule('@deck.gl/mesh-layers');
-      await loadScript('https://unpkg.com/@loaders.gl/gltf@^4.0.0/dist/dist.min.js');
+      await loadScript(GLTF_LOADER_URL, GLTF_LOADER_SRI);
       const reg = (window.deck && window.deck.registerLoaders) ||
                   (window.loaders && window.loaders.registerLoaders);
       const GLTFLoader = window.loaders && window.loaders.GLTFLoader;

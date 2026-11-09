@@ -21,7 +21,12 @@ export function loadDeckModule(pkg) {
   if (cache[pkg]) return cache[pkg];
   const run = async function () {
     const prev = window.deck;
-    const ver = (prev && prev.VERSION) || 'latest';
+    const ver = prev && prev.VERSION;
+    // Only ever the page's own exact deck.gl version: never 'latest' or a range, which would run
+    // whatever was published most recently.
+    if (!ver || !/^\d+\.\d+\.\d+$/.test(ver)) {
+      throw new Error('[my-deck-widgets] page deck.gl has no exact VERSION; not loading ' + pkg);
+    }
     try {
       await loadScript('https://unpkg.com/' + pkg + '@' + ver + '/dist.min.js');
       return window.deck;
