@@ -1067,8 +1067,12 @@ function createTimeline(deck, props) {
     followTs = now;
     followCenter = [lon, lat];
     _deckViewState = Object.assign({}, v, { longitude: lon, latitude: lat });
-    if (autoRotateSpeed === 0) deck.setProps({ viewState: _deckViewState });
-    else if (!isPlaying) deck.setProps({ viewState: Object.assign({}, _deckViewState, { bearing: rotateBearing }) });
+    // Following over higher ground pulls the shown view back above it; the chosen zoom is kept and returns
+    // when the ground falls away.
+    if (autoRotateSpeed === 0) deck.setProps({ viewState: aboveGround(_deckViewState) });
+    else if (!isPlaying) {
+      deck.setProps({ viewState: aboveGround(Object.assign({}, _deckViewState, { bearing: rotateBearing })) });
+    }
     // while playing with auto-rotation, frame() applies _deckViewState together with the bearing
     // Paused, nothing redraws, so keep gliding until the camera reaches the marker.
     const far = Math.abs(lon - h.position[0]) + Math.abs(lat - h.position[1]) > 1e-7;
@@ -1308,7 +1312,8 @@ function createTimeline(deck, props) {
       const rdt = lastRotateTs ? (timestamp - lastRotateTs) : 0;
       lastRotateTs = timestamp;
       if (!userInteracting) rotateBearing = (rotateBearing + autoRotateSpeed * rdt / 1000) % 360;
-      deck.setProps({ viewState: Object.assign({}, _deckViewState, { bearing: rotateBearing }) });
+      // Turning swings the camera over other ground: keep it above (aboveGround).
+      deck.setProps({ viewState: aboveGround(Object.assign({}, _deckViewState, { bearing: rotateBearing })) });
     }
 
     requestAnimationFrame(frame);
@@ -1405,6 +1410,58 @@ function createTimeline(deck, props) {
   function withGround(view) {
     if (!view || !groundLift || view.position) return view;
     return Object.assign({}, view, { position: [0, 0, groundLift] });
+  }
+
+  // --- Keeping the camera above the 3D terrain ---------------------------------------
+  // deck.gl places the camera from the zoom, tilt and the view's target height, not from the ground
+  // under it, so zooming in over high ground put the camera inside the terrain and the screen showed only
+  // the page background. aboveGround(view) is the view at the closest zoom that keeps the camera
+  // CLEARANCE_M (plus a tenth of its height) above the ground from beneath it to the view's centre, read
+  // from draw_animated_map's window.__terrainGrid (each cell's highest corner); outside the grid the grid's
+  // highest point stands in. Views without a terrain grid (flat maps) are returned as given.
+  const CLEARANCE_M = 40, EARTH_M = 40075016.686, M_PER_DEG_GROUND = 111320;
+  let gridMax = null;
+  function gridHeight(lon, lat) {
+    const G = window.__terrainGrid;
+    if (gridMax === null) gridMax = G.z.reduce(function (m, z) { return z > m ? z : m; }, -Infinity);
+    if (lon < G.w || lon > G.e || lat < G.s || lat > G.n) return gridMax;
+    const fx = (lon - G.w) / (G.e - G.w) * (G.nx - 1), fy = (lat - G.s) / (G.n - G.s) * (G.ny - 1);
+    const x0 = Math.min(G.nx - 2, Math.floor(fx)), y0 = Math.min(G.ny - 2, Math.floor(fy));
+    const z = G.z, nx = G.nx;
+    // The cell's highest corner, not an interpolation: a cell is kilometres across, and on a steep slope
+    // the drawn terrain inside it rises well above the average of its corners.
+    return Math.max(z[y0 * nx + x0], z[y0 * nx + x0 + 1], z[(y0 + 1) * nx + x0], z[(y0 + 1) * nx + x0 + 1]);
+  }
+  function cameraClear(view, zoom, height) {
+    // Camera distance from the target in metres (deck's MapView: `altitude` viewport heights away).
+    const altitude = view.fovy ? 0.5 / Math.tan(view.fovy * Math.PI / 360) : 1.5;
+    const range = altitude * height * EARTH_M * Math.cos(view.latitude * Math.PI / 180) / (512 * Math.pow(2, zoom));
+    const tilt = (view.pitch || 0) * Math.PI / 180, back = ((view.bearing || 0) + 180) * Math.PI / 180;
+    const up = range * Math.cos(tilt), out = range * Math.sin(tilt);
+    const cosLat = Math.cos(view.latitude * Math.PI / 180);
+    // The ground from beneath the camera to the view's centre: looking up at a slope that rises above the
+    // camera also leaves holes (deck.gl drops terrain tiles close to it), so it counts too.
+    let ground = -Infinity;
+    for (let k = 0; k <= 8; k++) {
+      const d = out * k / 8;
+      ground = Math.max(ground, gridHeight(view.longitude + d * Math.sin(back) / (M_PER_DEG_GROUND * cosLat),
+                                           view.latitude + d * Math.cos(back) / M_PER_DEG_GROUND));
+    }
+    const targetZ = (view.position && view.position[2]) || 0;
+    return targetZ + 0.9 * up >= ground + CLEARANCE_M;
+  }
+  function aboveGround(view) {
+    const G = window.__terrainGrid;
+    if (!view || view.zoom == null || !G || !G.z || !G.z.length) return view;
+    const height = deck.height || (deck.canvas && deck.canvas.clientHeight) || 720;
+    if (cameraClear(view, view.zoom, height)) return view;
+    let lo = view.minZoom != null ? view.minZoom : 0, hi = view.zoom;
+    if (!cameraClear(view, lo, height)) return view;
+    for (let i = 0; i < 24; i++) {
+      const mid = (lo + hi) / 2;
+      if (cameraClear(view, mid, height)) lo = mid; else hi = mid;
+    }
+    return Object.assign({}, view, { zoom: lo });
   }
   // deck.gl's ResetViewWidget goes back to deck's initialViewState unless given its own. This widget
   // rewrites initialViewState whenever it hands the camera back to the viewer (releaseCamera: the
@@ -1522,6 +1579,30 @@ function createTimeline(deck, props) {
         }
       });
       document.addEventListener('keydown', onEscape);
+    }
+    // Every zoom, tilt and pan the viewer makes stops where the camera would go under the terrain
+    // (aboveGround). Set last, so it runs first and the handlers above see the limited view.
+    if (window.__terrainGrid) {
+      const _innerOnVS = deck.props.onViewStateChange;
+      let lastUserView = null;
+      deck.setProps({
+        onViewStateChange: function (params) {
+          let view = params.viewState;
+          if (!window.__camPreviewOn) {
+            let safe = aboveGround(view);
+            const zooming = (params.interactionState || {}).isZooming;
+            if (safe !== view && zooming && lastUserView && safe.zoom <= lastUserView.zoom + 1e-6) {
+              // At the limit, zooming towards the cursor would only slide the map: hold it where it was.
+              safe = Object.assign({}, safe, { longitude: lastUserView.longitude, latitude: lastUserView.latitude });
+            }
+            view = safe;
+            lastUserView = view;
+            params = Object.assign({}, params, { viewState: view });
+          }
+          const fromInner = _innerOnVS ? _innerOnVS(params) : null;
+          return fromInner || view;
+        }
+      });
     }
     if (LAYER_SPECS.some(function (s) { return s.kind === 'trips' && s.hoverInfo; })) {
       // Markers carry their own tooltip HTML (__tip); anything else keeps the map's tooltip.
