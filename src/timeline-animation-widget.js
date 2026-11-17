@@ -322,10 +322,14 @@ function createTimeline(deck, props) {
   }
 
   // Data seconds that play per playback second, at time t.
+  // A video can play the data at another pace than the map (part of the timeline, another length): the
+  // exporter sets rateScale = the video's data seconds per second / the map's (setRateScale), so whatever
+  // is set in seconds of playback (marker turning, sun smoothing, 3D-model walk cycles) is in video seconds.
+  let rateScale = 1;
   function dataRate(t) {
-    if (!pace) return maxTime / durationSec;
+    if (!pace) return rateScale * maxTime / durationSec;
     const b = Math.max(0, Math.min(pace.N - 1, Math.floor(t / pace.bw)));
-    return pace.total * pace.bw / (durationSec * (pace.cum[b + 1] - pace.cum[b]));
+    return rateScale * pace.total * pace.bw / (durationSec * (pace.cum[b + 1] - pace.cum[b]));
   }
 
   // The middle of the animated data (first fix of each track), for the sun and night pacing.
@@ -1695,9 +1699,10 @@ function createTimeline(deck, props) {
       isPlaying = false; pausing = false; effRate = 0;
       seekTo(t);
       // Headless: 3D-model animations at the playback time, so every exported frame is exact.
-      if (headless && deckTimeline) { deckTimeline.pause(); deckTimeline.setTime(progress * durationSec * 1000); }
+      if (headless && deckTimeline) { deckTimeline.pause(); deckTimeline.setTime(progress * durationSec * 1000 / rateScale); }
       redraw();
-    }
+    },
+    setRateScale(s) { rateScale = (s > 0 && isFinite(s)) ? s : 1; }
   };
   window.__tripsAnim = bridge;
 

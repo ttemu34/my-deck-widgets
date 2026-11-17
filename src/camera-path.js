@@ -422,33 +422,88 @@ export function createCameraPath() {
   }
 
   // ---------------------------------------------------------------------------
-  // Follow a subject: behind it, facing where it is heading (or a set heading)
+  // Follow a subject: behind it, at a set distance, facing where it is heading (or a set heading)
   // ---------------------------------------------------------------------------
   function chasePath(times, o, base) {
     var tr = subjectTrack(o.subject);
     if (!tr) return copies(base, times.length);
-    return chaseViews(tr, times, o, base, null);
+    return chaseViews(tr, times, o, base);
   }
-  // Behind one subject, facing where it heads, with lead room ahead and the zoom following its pace.
-  // `fol` carries the smoothing state across calls (Subject tour), or null for a fresh one.
-  function chaseViews(tr, times, o, base, fol) {
-    var w = motionWindow(), typ = typicalSpeed();
-    var dist = o.range_m || 800, tilt = o.tilt == null ? 60 : o.tilt;
-    var lead = o.lead_room == null ? 0.15 : o.lead_room, sz = o.speed_zoom == null ? 0.5 : o.speed_zoom;
-    fol = fol || new Follower(o, o.follow_smoothing, o.turn_smoothing, 0.3, 0.15);
-    var brg = null;
-    return times.map(function (t) {
-      var p = posAt(tr, t), m = motionAt(tr, t, w), r = typ > 0 ? m.speed / typ : 1;
-      if (o.heading != null) brg = o.heading;
-      else if (m.heading != null) brg = m.heading;
-      else if (brg == null) brg = base.bearing;
-      var zoom = zoomForRange(dist, p[1], o.height, o.fov) + speedZoomDelta(r, sz);
-      // Lead room: look a little ahead of a moving subject, so it sits behind the frame's centre.
-      var ahead = (m.heading != null ? lead * Math.min(1, r) : 0) * viewGroundM(zoom, p[1], o, tilt) * 0.5;
-      var q = ahead > 0 ? offsetLL(p[0], p[1], m.heading, ahead) : p;
-      var v = fol.step({ longitude: q[0], latitude: q[1], zoom: zoom, bearing: brg });
-      return { longitude: v.longitude, latitude: v.latitude, zoom: v.zoom, pitch: tilt, bearing: v.bearing,
-               position: [0, 0, p[2] || 0] };
+  // Seconds of video either side of a frame that smoothing looks at, from a 0..1 setting where 1 = none.
+  var BEHIND_SMOOTH_S = 1.0, BEHIND_TURN_S = 2.0, BEHIND_AHEAD_S = 0.5;
+  // How far from the frame's centre the subject may drift (share of half the view's height) before the
+  // camera gives up smoothing to keep it there, and the share of the range it must move to count as moving.
+  var BEHIND_MAX_OFF = 0.35, BEHIND_MOVE_SHARE = 0.1;
+  function windowFrames(setting, seconds, fps) {
+    var s = setting == null ? 0.7 : Math.max(0, Math.min(1, setting));
+    return Math.round((1 - s) * seconds * fps);
+  }
+  // Mean of xs[i - k .. i + k] for every i (the ends use what there is), from prefix sums.
+  function centredMean(xs, k) {
+    var n = xs.length, pre = [0];
+    for (var i = 0; i < n; i++) pre.push(pre[i] + xs[i]);
+    return xs.map(function (_, i) {
+      var a = Math.max(0, i - k), b = Math.min(n - 1, i + k);
+      return (pre[b + 1] - pre[a]) / (b - a + 1);
+    });
+  }
+  // Behind one subject at `range_m`, `tilt` from straight down, facing where it travels. The whole clip is
+  // planned at once, so smoothing looks both ways and never trails the subject:
+  //  - the camera aims at the subject's path averaged over a short window either side (follow_smoothing),
+  //    but never so far from the subject that it leaves the middle of the frame (BEHIND_MAX_OFF);
+  //  - it faces the direction that averaged path travels, holds it while the subject rests, and turns
+  //    smoothly (turn_smoothing);
+  //  - the distance stays at `range_m` unless speed_zoom pulls it in and out; lead_room aims ahead of it.
+  function chaseViews(tr, times, o, base) {
+    var n = times.length;
+    if (!n) return [];
+    var fps = o.fps || 30, dist = o.range_m || 800, tilt = o.tilt == null ? 60 : o.tilt;
+    var lead = o.lead_room || 0, sz = o.speed_zoom || 0;
+    var raw = times.map(function (t) { return posAt(tr, t); });
+    var lat0 = raw[0][1], lon0 = raw[0][0], kx = M_PER_DEG * Math.cos(lat0 * Math.PI / 180);
+    var X = raw.map(function (p) { return (p[0] - lon0) * kx; }), Y = raw.map(function (p) { return (p[1] - lat0) * M_PER_DEG; });
+    var Z = raw.map(function (p) { return p[2] || 0; });
+    var kPos = windowFrames(o.follow_smoothing, BEHIND_SMOOTH_S, fps);
+    var sx = centredMean(X, kPos), sy = centredMean(Y, kPos), sz2 = centredMean(Z, kPos);
+
+    // Heading: from the subject towards where its averaged path is BEHIND_AHEAD_S of video later (where it
+    // is going next), held while it rests, then smoothed across the turn window.
+    var kTurn = Math.max(1, windowFrames(o.turn_smoothing, BEHIND_TURN_S, fps));
+    var kAhead = Math.max(1, Math.round(BEHIND_AHEAD_S * fps));
+    var hx = [], hy = [];
+    for (var i = 0; i < n; i++) {
+      var b = Math.min(n - 1, i + kAhead), a = Math.max(0, b - kAhead);
+      hx.push(sx[b] - sx[a]); hy.push(sy[b] - sy[a]);
+    }
+    var minMove = Math.max(20, dist * BEHIND_MOVE_SHARE), brg = new Array(n), last = null;
+    for (var j = 0; j < n; j++) {
+      if (o.heading != null) brg[j] = o.heading;
+      else {
+        if (Math.hypot(hx[j], hy[j]) >= minMove) last = Math.atan2(hx[j], hy[j]) * 180 / Math.PI;
+        brg[j] = last;
+      }
+    }
+    var first = brg.find(function (v) { return v != null; });
+    if (first == null) first = base.bearing || 0;
+    for (var f = 0; f < n && brg[f] == null; f++) brg[f] = first;   // rests at the start: its first heading
+    for (var u = 1; u < n; u++) brg[u] = brg[u - 1] + shortestAngle(brg[u - 1], brg[u]);   // unwrapped
+    brg = centredMean(brg, kTurn);
+
+    var typ = sz ? typicalSpeed() : 0, w = sz ? motionWindow() : 0;
+    return times.map(function (t, i) {
+      var lat = lat0 + sy[i] / M_PER_DEG;
+      var zoom = zoomForRange(dist, lat, o.height, o.fov);
+      if (sz && typ > 0) zoom += speedZoomDelta(motionAt(tr, t, w).speed / typ, sz);
+      // Keep the subject near the centre: pull the aim towards it when the averaged path strays too far.
+      var maxOff = BEHIND_MAX_OFF * viewGroundM(zoom, lat, o, tilt) * 0.5;
+      var ox = X[i] - sx[i], oy = Y[i] - sy[i], off = Math.hypot(ox, oy);
+      var pull = off > maxOff ? 1 - maxOff / off : 0;
+      var cx = sx[i] + ox * pull, cy = sy[i] + oy * pull;
+      var c = [lon0 + cx / kx, lat0 + cy / M_PER_DEG];
+      var heading = ((brg[i] % 360) + 360) % 360;
+      if (lead > 0) c = offsetLL(c[0], c[1], heading, lead * viewGroundM(zoom, c[1], o, tilt) * 0.5);
+      return { longitude: c[0], latitude: c[1], zoom: zoom, pitch: tilt, bearing: heading,
+               position: [0, 0, sz2[i] + (Z[i] - sz2[i]) * pull] };
     });
   }
 
@@ -480,7 +535,7 @@ export function createCameraPath() {
     for (var k = 0; k < N; k++) {
       var i0 = Math.round(k * n / N), i1 = Math.round((k + 1) * n / N);
       if (i1 <= i0) continue;
-      var seg = chaseViews(list[k], times.slice(i0, i1), o, base, null);
+      var seg = chaseViews(list[k], times.slice(i0, i1), o, base);
       var nTrans = k > 0 && prevEnd ? Math.round((i1 - i0) * trans) : 0;
       var label = o.name_cards === false ? null : trackLabel(list[k], k);
       for (var i = i0; i < i1; i++) {
