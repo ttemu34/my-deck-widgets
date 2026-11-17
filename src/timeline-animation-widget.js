@@ -564,7 +564,10 @@ function createTimeline(deck, props) {
       const label = st.labels[i];
       const col = head.color || st.colors[i];
       const look = speedLook(r.speed, st, spec);
-      const d = { position: r.pos, color: col, heading: r.heading, pitch: r.pitch, fi: i, label: label,
+      // A 3D animal stands on the ground: the track is drawn spec.aboveGroundM higher to show over the terrain.
+      const drop = (spec.head.kind === 'model' && spec.meshHeight == null) ? (spec.aboveGroundM || 0) : 0;
+      const pos = drop ? [r.pos[0], r.pos[1], (r.pos[2] || 0) - drop] : r.pos;
+      const d = { position: pos, color: col, heading: r.heading, pitch: r.pitch, fi: i, label: label,
                   move: look.move, scale: look.scale, state: look.state };
       if (spec.hoverInfo) {
         const name = st.tips[i] || ('Track ' + (i + 1));
@@ -712,6 +715,8 @@ function createTimeline(deck, props) {
           data: g === 'all' ? heads : heads.filter(function (d) { return d.state === g; }),
           scenegraph: m.uri,
           getPosition: function (d) { return d.position; },
+          // A model whose origin is mid-body would stand partly underground: raise it (metres, world up).
+          getTranslation: [0, 0, m.liftM || 0],
           getOrientation: function (d) {
             const yaw = (m.faceHeading ? -d.heading : 0) + m.yawOffset;
             const pitch = m.pitch + (m.terrainPitch ? m.terrainScale * d.pitch : 0);
@@ -1406,7 +1411,8 @@ function createTimeline(deck, props) {
     Object.keys(animatedById).forEach(function (id) {
       const st = animatedById[id].state;
       ((st && st.tracks) || []).forEach(function (tr) {
-        (tr ? tr.C : []).forEach(function (p) { if (p.length > 2 && isFinite(p[2])) { sum += p[2]; n++; } });
+        const up = animatedById[id].spec.aboveGroundM || 0;   // tracks are drawn this far above the ground
+        (tr ? tr.C : []).forEach(function (p) { if (p.length > 2 && isFinite(p[2])) { sum += p[2] - up; n++; } });
       });
     });
     groundLift = n ? sum / n : 0;

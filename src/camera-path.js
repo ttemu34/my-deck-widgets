@@ -68,6 +68,8 @@ export function createCameraPath() {
         if (s.kind === 'trips') {
           var C = d.geometry && d.geometry.coordinates, T = d.timestamps;
           if (!C || !T || !C.length) return;
+          // Tracks are drawn s.aboveGroundM over the ground to show over the terrain; cameras aim at the ground.
+          if (s.aboveGroundM) C = C.map(function (p) { return [p[0], p[1], (p[2] || 0) - s.aboveGroundM]; });
           tracks.push({ d: d, C: C, T: T, id: s.id });
           for (var k = 0; k < C.length; k++) all.push(C[k]);
           end = Math.max(end, T[T.length - 1]);
@@ -326,11 +328,17 @@ export function createCameraPath() {
   function clearAt(v, p, R, tz) {
     var horiz = R * Math.sin(p * Math.PI / 180), up = R * Math.cos(p * Math.PI / 180);
     var back = (v.bearing || 0) + 180;
+    // Heights relative to the grid's own height at the target: the grid is kilometres coarse, so its absolute
+    // height there can be tens of metres off the ground the target sits on, which at close range read as a
+    // ridge in the way. The margin grows from nothing at the target to LOS_CLEARANCE_M at the camera.
+    var g0 = terrainAt(v.longitude, v.latitude);
     for (var k = 1; k <= 16; k++) {
       var u = 0.06 + 0.94 * k / 16;                   // from just off the target to the camera
       var q = offsetLL(v.longitude, v.latitude, back, horiz * u);
       var g = terrainAt(q[0], q[1]);
-      if (g != null && g + LOS_CLEARANCE_M > tz + up * u) return false;
+      if (g == null) continue;
+      var rise = g0 != null ? g - g0 : g - tz, margin = Math.min(LOS_CLEARANCE_M * u, 0.2 * up * u);
+      if (rise + margin > up * u) return false;
     }
     return true;
   }
@@ -433,7 +441,7 @@ export function createCameraPath() {
   var BEHIND_SMOOTH_S = 1.0, BEHIND_TURN_S = 2.0, BEHIND_AHEAD_S = 0.5;
   // How far from the frame's centre the subject may drift (share of half the view's height) before the
   // camera gives up smoothing to keep it there, and the share of the range it must move to count as moving.
-  var BEHIND_MAX_OFF = 0.35, BEHIND_MOVE_SHARE = 0.1;
+  var BEHIND_MAX_OFF = 0.2, BEHIND_MOVE_SHARE = 0.1;
   function windowFrames(setting, seconds, fps) {
     var s = setting == null ? 0.7 : Math.max(0, Math.min(1, setting));
     return Math.round((1 - s) * seconds * fps);
@@ -457,7 +465,7 @@ export function createCameraPath() {
   function chaseViews(tr, times, o, base) {
     var n = times.length;
     if (!n) return [];
-    var fps = o.fps || 30, dist = o.range_m || 800, tilt = o.tilt == null ? 60 : o.tilt;
+    var fps = o.fps || 30, dist = o.range_m || 100, tilt = o.tilt == null ? 60 : o.tilt;
     var lead = o.lead_room || 0, sz = o.speed_zoom || 0;
     var raw = times.map(function (t) { return posAt(tr, t); });
     var lat0 = raw[0][1], lon0 = raw[0][0], kx = M_PER_DEG * Math.cos(lat0 * Math.PI / 180);
