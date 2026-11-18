@@ -403,7 +403,7 @@ export function createCameraPath() {
   // ---------------------------------------------------------------------------
   function flyAroundSetup(o, base) {
     var lon = (o.lon != null) ? o.lon : base.longitude, lat = (o.lat != null) ? o.lat : base.latitude;
-    var zoom = (o.range_m != null) ? zoomForRange(o.range_m, lat, o.height, o.fov) : base.zoom;
+    var zoom = (o.range != null) ? zoomForRange(o.range, lat, o.height, o.fov) : base.zoom;
     var end = { longitude: lon, latitude: lat, zoom: zoom, pitch: base.pitch, bearing: base.bearing };
     return { start: base, end: end, fly: flyer(),
              frac: o.fly_frac == null ? 0.25 : o.fly_frac, rounds: o.rounds == null ? 1 : o.rounds,
@@ -457,18 +457,18 @@ export function createCameraPath() {
       return (pre[b + 1] - pre[a]) / (b - a + 1);
     });
   }
-  // Behind one subject at `range_m`, `tilt` from straight down, facing the way the subject faces. The whole
+  // Behind one subject at `range`, `tilt` from straight down, facing the way the subject faces. The whole
   // clip is planned at once, so smoothing looks both ways and never trails the subject:
   //  - the camera aims at the subject's path averaged over a short window either side (follow_smoothing),
   //    but never so far from the subject that it leaves the middle of the frame (BEHIND_MAX_OFF);
   //  - it faces the way the drawn marker faces (the page's markerTrack: the same heading its 3D model is
   //    turned to), so it stays directly behind it, lightly smoothed (turn_smoothing). On pages without
   //    markerTrack it faces where the averaged path goes next instead, held while the subject rests;
-  //  - the distance stays at `range_m` unless speed_zoom pulls it in and out; lead_room aims ahead of it.
+  //  - the distance stays at `range` unless speed_zoom pulls it in and out; lead_room aims ahead of it.
   function chaseViews(tr, times, o, base) {
     var n = times.length;
     if (!n) return [];
-    var fps = o.fps || 30, dist = o.range_m || 100, tilt = o.tilt == null ? 60 : o.tilt;
+    var fps = o.fps || 30, dist = o.range || 100, tilt = o.tilt == null ? 60 : o.tilt;
     var lead = o.lead_room || 0, sz = o.speed_zoom || 0;
     var raw = times.map(function (t) { return posAt(tr, t); });
     var A = window.__tripsAnim;
@@ -692,7 +692,7 @@ export function createCameraPath() {
   // ---------------------------------------------------------------------------
   function cinematicPath(times, o, base, c) {
     var intro = o.intro_frac == null ? 0.12 : o.intro_frac, n = times.length;
-    var mode = o.bearing_mode || 'rotate', turn = o.rotate_deg == null ? 45 : o.rotate_deg;
+    var mode = o.bearing_mode || 'rotate', turn = o.rotation == null ? 45 : o.rotation;
     var p0 = (initialView() || {}).pitch || 0;
     var views = actionViews(times, o, base, c, function (m, prog) {
       if (mode === 'heading') return m.heading;

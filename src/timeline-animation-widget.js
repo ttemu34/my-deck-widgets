@@ -495,9 +495,10 @@ function createTimeline(deck, props) {
   // How a marker responds to its speed: `move` 0 (resting) .. 1 (moving), `fast` 0 .. 1 above its
   // typical speed, the dot `scale`, and the 3D model's animation `state`. Smooth in speed, so a
   // marker never flickers between sizes.
-  function speedLook(speed, st, spec) {
+  const REST_FRACTION = 0.1, MIN_REST_KMH = 0.05;
+  function speedLook(speed, st, spec, i) {
     if (!spec.speedResponse) return { move: 1, fast: 0, scale: 1, state: 'walk' };
-    const rest = PACING.restKmh, typ = Math.max(st.typKmh || 0, rest * 2, 1e-3);
+    const rest = st.restKmh[i] || MIN_REST_KMH, typ = Math.max(st.typKmh || 0, rest * 2, 1e-3);
     const v = isFinite(speed) ? speed : 0;
     const move = smoothstep(rest * 0.5, Math.max(rest * 1.5, typ * 0.5), v);
     const fast = smoothstep(typ * 1.5, typ * 3, v);
@@ -509,7 +510,7 @@ function createTimeline(deck, props) {
   // moving speed) or by day / night (sun altitude at each fix). null -> the track's own colour.
   function vertexColors(rows, spec, st) {
     if (spec.cometColor === 'speed') {
-      const top = Math.max(st.p95Kmh || 0, PACING.restKmh * 4, 1e-3);
+      const top = Math.max(st.p95Kmh || 0, 1e-3);
       return rows.map(function (r) {
         const C = r.geometry.coordinates, T = r.timestamps, out = [];
         for (let k = 0; k < C.length; k++) {
@@ -563,7 +564,7 @@ function createTimeline(deck, props) {
       if (!r) continue;
       const label = st.labels[i];
       const col = head.color || st.colors[i];
-      const look = speedLook(r.speed, st, spec);
+      const look = speedLook(r.speed, st, spec, i);
       // A 3D animal stands on the ground: the track is drawn spec.aboveGroundM higher to show over the terrain.
       const drop = (spec.head.kind === 'model' && spec.meshHeight == null) ? (spec.aboveGroundM || 0) : 0;
       const pos = drop ? [r.pos[0], r.pos[1], (r.pos[2] || 0) - drop] : r.pos;
@@ -779,18 +780,22 @@ function createTimeline(deck, props) {
           return feats.map(function (f) { const v = name ? f[name] : null; return v == null ? '' : String(v); });
         }
         // Speeds while moving, for the speed response (typical) and the speed colours (95th percentile).
+        // "Resting" is relative to each track's own speeds (an elephant, a vehicle and an aircraft rest
+        // at very different speeds): below REST_FRACTION of that track's 90th-percentile speed.
         const moving = [];
-        tracks.forEach(function (tr) {
-          if (!tr) return;
-          for (let j = 0; j + 1 < tr.T.length; j++) {
-            const v = segKmh(tr, j);
-            if (!tr.gap[j] && v >= PACING.restKmh) moving.push(v);
-          }
+        const restKmh = tracks.map(function (tr) {
+          if (!tr) return MIN_REST_KMH;
+          const all = [];
+          for (let j = 0; j + 1 < tr.T.length; j++) if (!tr.gap[j]) all.push(segKmh(tr, j));
+          all.sort(function (a, b) { return a - b; });
+          const rest = Math.max(MIN_REST_KMH, REST_FRACTION * (all.length ? all[Math.floor(all.length * 0.9)] : 0));
+          all.forEach(function (v) { if (v >= rest) moving.push(v); });
+          return rest;
         });
         moving.sort(function (a, b) { return a - b; });
         const st = {
           cursors: new Array(n).fill(0), lastHeading: new Array(n).fill(0),
-          tracks: tracks, colors: colors, labels: col(spec.labelCol), tips: col(spec.tipCol),
+          tracks: tracks, restKmh: restKmh, colors: colors, labels: col(spec.labelCol), tips: col(spec.tipCol),
           trailData: trailRows(feats, tracks, spec), heads: [],
           typKmh: moving.length ? moving[moving.length >> 1] : 0,
           p95Kmh: moving.length ? moving[Math.floor(moving.length * 0.95)] : 0,

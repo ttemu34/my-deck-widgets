@@ -363,7 +363,7 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
 
   // The map's view as the camera fields this camera has (Google Maps 3D terms: center, range in
   // metres, tilt, heading), so Copy settings captures what is on screen.
-  const VIEW_FIELDS = { lon: 1, lat: 1, range_m: 1, tilt: 1, heading: 1 };
+  const VIEW_FIELDS = { lon: 1, lat: 1, range: 1, tilt: 1, heading: 1 };
   function useCurrentView(cs) {
     const v = currentView();
     if (!v) return;
@@ -373,7 +373,7 @@ function createCameraPanel(CAMERAS, opts, getRoot) {
     const heading = (((v.bearing || 0) + 180) % 360 + 360) % 360 - 180;
     const from = {
       lon: round(v.longitude, 6), lat: round(v.latitude, 6),
-      range_m: Math.round(window.__cam.rangeForZoom(v.zoom, v.latitude, height, values.fov)),
+      range: Math.round(window.__cam.rangeForZoom(v.zoom, v.latitude, height, values.fov)),
       tilt: round(v.pitch || 0, 1), heading: round(heading, 1)
     };
     camera(cs.type).fields.forEach(function (f) {
