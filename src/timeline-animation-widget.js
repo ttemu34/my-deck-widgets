@@ -1708,7 +1708,22 @@ function createTimeline(deck, props) {
       if (headless && deckTimeline) { deckTimeline.pause(); deckTimeline.setTime(progress * durationSec * 1000 / rateScale); }
       redraw();
     },
-    setRateScale(s) { rateScale = (s > 0 && isFinite(s)) ? s : 1; }
+    setRateScale(s) { rateScale = (s > 0 && isFinite(s)) ? s : 1; },
+    // Where row `fi` of trips layer `layerId` is drawn at each of `times` (in order), and which way it faces:
+    // [{pos: [lon, lat, z], heading}] (null inside a data gap). The video camera follows a marker from
+    // behind with these, so it faces exactly the way the drawn marker does. A scratch state, so the map's
+    // own markers are untouched; set the video pace (setRateScale) first, as the turning depends on it.
+    markerTrack(layerId, fi, times) {
+      const a = animatedById && animatedById[layerId];
+      if (!a || a.spec.kind !== 'trips' || !a.state.tracks || !a.state.tracks[fi]) return null;
+      const spec = a.spec, tr = a.state.tracks[fi], st = { cursors: [], lastHeading: [] };
+      const drop = (spec.head.kind === 'model' && spec.meshHeight == null) ? (spec.aboveGroundM || 0) : 0;
+      return times.map(function (t) {
+        const r = headAt(tr, fi, t, st, spec.head, spec);
+        if (!r) return null;
+        return { pos: [r.pos[0], r.pos[1], (r.pos[2] || 0) - drop], heading: r.heading };
+      });
+    },
   };
   window.__tripsAnim = bridge;
 

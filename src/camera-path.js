@@ -64,13 +64,13 @@ export function createCameraPath() {
     specs.forEach(function (s) {
       var L = layers.find(function (l) { return l.id === s.id; });
       var data = (L && Array.isArray(L.data)) ? L.data : [];
-      data.forEach(function (d) {
+      data.forEach(function (d, fi) {
         if (s.kind === 'trips') {
           var C = d.geometry && d.geometry.coordinates, T = d.timestamps;
           if (!C || !T || !C.length) return;
           // Tracks are drawn s.aboveGroundM over the ground to show over the terrain; cameras aim at the ground.
           if (s.aboveGroundM) C = C.map(function (p) { return [p[0], p[1], (p[2] || 0) - s.aboveGroundM]; });
-          tracks.push({ d: d, C: C, T: T, id: s.id });
+          tracks.push({ d: d, C: C, T: T, id: s.id, fi: fi });   // fi: its row, for markerTrack
           for (var k = 0; k < C.length; k++) all.push(C[k]);
           end = Math.max(end, T[T.length - 1]);
         } else {
@@ -439,6 +439,8 @@ export function createCameraPath() {
   }
   // Seconds of video either side of a frame that smoothing looks at, from a 0..1 setting where 1 = none.
   var BEHIND_SMOOTH_S = 1.0, BEHIND_TURN_S = 2.0, BEHIND_AHEAD_S = 0.5;
+  // Following the drawn marker's own heading, which is already smoothed: only a light extra smoothing.
+  var BEHIND_MARKER_TURN_S = 0.5;
   // How far from the frame's centre the subject may drift (share of half the view's height) before the
   // camera gives up smoothing to keep it there, and the share of the range it must move to count as moving.
   var BEHIND_MAX_OFF = 0.2, BEHIND_MOVE_SHARE = 0.1;
@@ -455,12 +457,13 @@ export function createCameraPath() {
       return (pre[b + 1] - pre[a]) / (b - a + 1);
     });
   }
-  // Behind one subject at `range_m`, `tilt` from straight down, facing where it travels. The whole clip is
-  // planned at once, so smoothing looks both ways and never trails the subject:
+  // Behind one subject at `range_m`, `tilt` from straight down, facing the way the subject faces. The whole
+  // clip is planned at once, so smoothing looks both ways and never trails the subject:
   //  - the camera aims at the subject's path averaged over a short window either side (follow_smoothing),
   //    but never so far from the subject that it leaves the middle of the frame (BEHIND_MAX_OFF);
-  //  - it faces the direction that averaged path travels, holds it while the subject rests, and turns
-  //    smoothly (turn_smoothing);
+  //  - it faces the way the drawn marker faces (the page's markerTrack: the same heading its 3D model is
+  //    turned to), so it stays directly behind it, lightly smoothed (turn_smoothing). On pages without
+  //    markerTrack it faces where the averaged path goes next instead, held while the subject rests;
   //  - the distance stays at `range_m` unless speed_zoom pulls it in and out; lead_room aims ahead of it.
   function chaseViews(tr, times, o, base) {
     var n = times.length;
@@ -468,6 +471,9 @@ export function createCameraPath() {
     var fps = o.fps || 30, dist = o.range_m || 100, tilt = o.tilt == null ? 60 : o.tilt;
     var lead = o.lead_room || 0, sz = o.speed_zoom || 0;
     var raw = times.map(function (t) { return posAt(tr, t); });
+    var A = window.__tripsAnim;
+    var marks = (tr.fi != null && A && typeof A.markerTrack === 'function') ? A.markerTrack(tr.id, tr.fi, times) : null;
+    if (marks) raw = raw.map(function (p, i) { return marks[i] ? marks[i].pos : p; });   // exactly where it is drawn
     var lat0 = raw[0][1], lon0 = raw[0][0], kx = M_PER_DEG * Math.cos(lat0 * Math.PI / 180);
     var X = raw.map(function (p) { return (p[0] - lon0) * kx; }), Y = raw.map(function (p) { return (p[1] - lat0) * M_PER_DEG; });
     var Z = raw.map(function (p) { return p[2] || 0; });
@@ -476,7 +482,7 @@ export function createCameraPath() {
 
     // Heading: from the subject towards where its averaged path is BEHIND_AHEAD_S of video later (where it
     // is going next), held while it rests, then smoothed across the turn window.
-    var kTurn = Math.max(1, windowFrames(o.turn_smoothing, BEHIND_TURN_S, fps));
+    var kTurn = Math.max(1, windowFrames(o.turn_smoothing, marks ? BEHIND_MARKER_TURN_S : BEHIND_TURN_S, fps));
     var kAhead = Math.max(1, Math.round(BEHIND_AHEAD_S * fps));
     var hx = [], hy = [];
     for (var i = 0; i < n; i++) {
@@ -486,7 +492,10 @@ export function createCameraPath() {
     var minMove = Math.max(20, dist * BEHIND_MOVE_SHARE), brg = new Array(n), last = null;
     for (var j = 0; j < n; j++) {
       if (o.heading != null) brg[j] = o.heading;
-      else {
+      else if (marks) {
+        if (marks[j]) last = marks[j].heading;                 // the drawn marker's own heading
+        brg[j] = last;
+      } else {
         if (Math.hypot(hx[j], hy[j]) >= minMove) last = Math.atan2(hx[j], hy[j]) * 180 / Math.PI;
         brg[j] = last;
       }
