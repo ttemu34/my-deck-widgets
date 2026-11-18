@@ -129,7 +129,7 @@ function createTimeline(deck, props) {
   const needsFilter = LAYER_SPECS.some(function (s) { return s.kind === 'window'; });
   // Tracks in relative_to_mesh mode are drawn a set height above the rendered terrain
   // (deck.gl TerrainExtension, 'offset'), not at the heights baked into their coordinates.
-  const needsMesh   = LAYER_SPECS.some(function (s) { return s.kind === 'trips' && s.meshHeight != null; });
+  const needsMesh   = LAYER_SPECS.some(function (s) { return s.meshHeight != null; });
   let __headReady   = !needsModel;
   let __filterReady = !needsFilter;
   let __meshReady   = !needsMesh;
@@ -912,6 +912,14 @@ function createTimeline(deck, props) {
     return layer.clone(props);
   }
 
+  // relative_to_mesh markers stand on the drawn surface: a 3D animal right on it, flat markers a hair above
+  // so the ground doesn't hide them.
+  const ON_TERRAIN_MARKER_M = 0.5;
+  function onTerrainMarker(layer) {
+    const isModel = layer.constructor && layer.constructor.layerName === 'ScenegraphLayer';
+    return onMesh(layer, isModel ? 0 : ON_TERRAIN_MARKER_M);
+  }
+
   function buildLayers() {
     const out = [], overlay = [];
     baseLayers.forEach(function (l) {
@@ -921,7 +929,8 @@ function createTimeline(deck, props) {
       const h = a.spec.meshHeight;
       const place = (h != null && TerrainExt) ? function (x) { return onMesh(x, h); } : null;
       out.push.apply(out, place ? built.layers.map(place) : built.layers);
-      overlay.push.apply(overlay, place ? built.overlay.map(place) : built.overlay);
+      // Markers stand on the drawn surface (a 3D animal right on it), not at the line's height above it.
+      overlay.push.apply(overlay, place ? built.overlay.map(onTerrainMarker) : built.overlay);
     });
     return out.concat(overlay);
   }
@@ -1717,7 +1726,9 @@ function createTimeline(deck, props) {
       const a = animatedById && animatedById[layerId];
       if (!a || a.spec.kind !== 'trips' || !a.state.tracks || !a.state.tracks[fi]) return null;
       const spec = a.spec, tr = a.state.tracks[fi], st = { cursors: [], lastHeading: [] };
-      const drop = (spec.head.kind === 'model' && spec.meshHeight == null) ? (spec.aboveGroundM || 0) : 0;
+      // Where the marker stands: on the ground for a 3D animal or a track on the drawn terrain, else on the line.
+      const onGround = spec.head.kind === 'model' || spec.meshHeight != null;
+      const drop = onGround ? (spec.aboveGroundM || 0) : 0;
       return times.map(function (t) {
         const r = headAt(tr, fi, t, st, spec.head, spec);
         if (!r) return null;
