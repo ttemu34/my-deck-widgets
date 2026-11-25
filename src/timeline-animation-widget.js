@@ -9,6 +9,14 @@
 //   click-to-follow. Across a data gap the trail breaks and the marker is hidden.
 // - 'window': any layer with a per-row time (`__t`, or `properties.__t`) shows only
 //   the rows inside [t - window, t], faded via DataFilterExtension on the GPU.
+// - 'raster': a series of images over one bounds box (a BitmapLayer each), one per period
+//   (`images`, `starts`, `ends`): each image is shown until the next one starts (across a
+//   period with no data too), cross-fading into it, and the last one stays to the end;
+//   draped on the terrain when `drape` is set.
+//
+// With a 3D terrain, layers that would otherwise sit at sea level under it are laid on it
+// (TerrainExtension): the static layers named in `terrainLayerIds` (boundaries, points,
+// bitmap overlays) and 'window' layers with `onTerrain`.
 //
 // Also: sun lighting that follows the data's real time, auto-rotate, and a playback
 // bar (PlaybackControls). Every time is in seconds on the shared timeline, which
@@ -27,8 +35,23 @@
 // panel (CameraPanelWidget) is on the page.
 
 import { Widget, WebMercatorViewport } from '@deck.gl/core';
+import { BitmapLayer } from '@deck.gl/layers';
 import { THEME_SURFACE } from './widget-theme';
 import { loadDeckModule, getTerrainExtension, loadTerrainExtension } from './deck-modules';
+
+// One frame of a raster series. deck.gl 9.2's BitmapLayer rebuilds its model when the layers' shader modules
+// change (TerrainExtension adds one to every layer once the first draped layer appears) but sets the model's
+// vertex count only when `bounds` changes, so a frame drawn before that has no geometry: it is in the terrain
+// cover but paints nothing. Whether that happens depended on which layer happened to bring the extension in
+// first (tracks on the terrain did; a map of rasters alone, or tracks clamped to the ground, didn't).
+class RasterFrameLayer extends BitmapLayer {
+  updateState(params) {
+    super.updateState(params);
+    const { model, mesh } = this.state;
+    if (params.changeFlags.extensionsChanged && model && mesh) model.setVertexCount(mesh.vertexCount);
+  }
+}
+RasterFrameLayer.layerName = 'RasterFrameLayer';
 
 export class TimelineAnimationWidget extends Widget {
   placement = 'bottom-left';
@@ -132,8 +155,22 @@ function createTimeline(deck, props) {
   const needsMesh   = LAYER_SPECS.some(function (s) { return s.meshHeight != null; });
   let __headReady   = !needsModel;
   let __filterReady = !needsFilter;
-  let __meshReady   = !needsMesh;
+  // Raster series drape their images on the rendered terrain (TerrainExtension, 'drape').
+  const needsDrape  = LAYER_SPECS.some(function (s) { return s.kind === 'raster' && s.drape; });
+  // Static layers and time-window layers laid on the terrain, which would otherwise sit at sea level under it.
+  const TERRAIN_LAYER_IDS = props.terrainLayerIds || [];
+  const needsOnTerrain = TERRAIN_LAYER_IDS.length > 0 || LAYER_SPECS.some(function (s) { return s.onTerrain; });
+  let __meshReady   = !(needsMesh || needsDrape || needsOnTerrain);
   let TerrainExt    = null;
+  let terrainExtFailed = false;   // TerrainExtension couldn't load: draw rasters flat rather than not at all
+  // Raster frames still being decoded (one count per series); the exporter waits for them (headReady).
+  let rasterPending = LAYER_SPECS.filter(function (s) { return s.kind === 'raster'; }).length;
+  let __rasterReady = rasterPending === 0;
+  function rasterLoaded() {
+    rasterPending -= 1;
+    if (rasterPending <= 0) __rasterReady = true;
+    if (animatedById) redraw();
+  }
 
   // Resolve a deck.gl class without hard-coding the global namespace.
   function resolveLayer(name) {
@@ -766,6 +803,31 @@ function createTimeline(deck, props) {
 
   // Each animator: init(base, spec) -> state; build(base, spec, state, t) -> { layers, overlay }.
   // `layers` replace the base layer in place; `overlay` is drawn on top of everything.
+  // Each frame's opacity at time t for a raster series: the latest frame to have started, at `opacity`, until
+  // the next one starts (so a period with no data shows the one before it, not nothing), and the last one to
+  // the end of the timeline. Over the last `crossFade` of that time the next frame fades in on top; the frame
+  // underneath fades so the two together keep the series' opacity, with no dip halfway through.
+  function rasterOpacities(spec, t) {
+    const S = spec.starts, n = S.length, a = spec.opacity;
+    const op = new Array(n).fill(0);
+    let j = -1;
+    for (let i = 0; i < n && S[i] <= t; i++) j = i;
+    if (j < 0) return op;   // before the first period
+    const k = j + 1;
+    let u = 0;
+    if (k < n) {
+      const fadeLen = spec.crossFade * (S[k] - S[j]);
+      if (fadeLen > 0) {
+        u = Math.min(1, Math.max(0, (t - (S[k] - fadeLen)) / fadeLen));
+        u = u * u * (3 - 2 * u);
+      }
+    }
+    const incoming = a * u;
+    op[j] = incoming < 1 ? Math.max(0, (a - incoming) / (1 - incoming)) : 0;
+    if (u > 0) op[k] = incoming;
+    return op;
+  }
+
   const ANIMATORS = {
     trips: {
       init: function (base, spec) {
@@ -882,6 +944,42 @@ function createTimeline(deck, props) {
         return { layers: [base.clone({ data: rows })], overlay: [] };
       },
     },
+
+    raster: {
+      // Every frame is decoded once and kept as a layer of its own (hidden when not shown), so stepping
+      // through time never reloads or re-uploads an image.
+      init: function (base, spec) {
+        const st = { bitmaps: null };
+        Promise.all(spec.images.map(function (uri) {
+          return fetch(uri).then(function (r) { return r.blob(); }).then(function (b) { return createImageBitmap(b); });
+        })).then(function (bitmaps) {
+          st.bitmaps = bitmaps;
+          rasterLoaded();
+        }, function (e) {
+          console.warn('[TimelineAnimationWidget] raster images could not be decoded: ' + base.id, e);
+          st.bitmaps = [];
+          rasterLoaded();
+        });
+        return st;
+      },
+      build: function (base, spec, st, t) {
+        if (!st.bitmaps || !st.bitmaps.length) return { layers: [], overlay: [] };
+        let place = {};
+        if (spec.drape) {
+          // Drawn flat it would sit at sea level, under the hills: wait for the extension (headReady does).
+          if (TerrainExt) place = { extensions: (base.props.extensions || []).concat([TerrainExt]), terrainDrawMode: 'drape' };
+          else if (!terrainExtFailed) return { layers: [], overlay: [] };
+        }
+        const op = rasterOpacities(spec, t);
+        // The ids say whether the extension is on: deck never sets up an extension added to an existing layer.
+        const suffix = place.extensions ? '-drape' : '';
+        return { layers: st.bitmaps.map(function (bitmap, i) {
+          return new RasterFrameLayer(Object.assign({}, base.props, {
+            id: base.id + '-f' + i + suffix, image: bitmap, opacity: op[i], visible: op[i] > 0,
+          }, place));
+        }), overlay: [] };
+      },
+    },
   };
 
   // relative_to_mesh: one layer moved onto the rendered terrain. Its paths/positions keep their
@@ -925,14 +1023,41 @@ function createTimeline(deck, props) {
     return onMesh(layer, isModel ? 0 : ON_TERRAIN_MARKER_M);
   }
 
+  // A layer laid on the rendered terrain (TerrainExtension; its own choice of mode: lines, polygons and
+  // images are painted onto the ground, points stand on it). The new id makes deck build a fresh layer, as an
+  // extension added to an existing one never gets set up. BitmapLayers become RasterFrameLayers, which keep
+  // their geometry when the terrain's shader module arrives.
+  const withTerrainExt = new WeakMap();   // a layer's extensions -> the same plus TerrainExtension (one array each,
+                                         // or deck would set the extensions up again every frame)
+  const NO_EXTENSIONS = [];
+  function onTerrain(layer) {
+    const p = layer.props;
+    const own = p.extensions || NO_EXTENSIONS;
+    let extensions = withTerrainExt.get(own);
+    if (!extensions) { extensions = own.concat([TerrainExt]); withTerrainExt.set(own, extensions); }
+    const props = { id: layer.id + '-terrain', extensions: extensions };
+    if (layer.constructor && layer.constructor.layerName === 'BitmapLayer') {
+      return new RasterFrameLayer(Object.assign({}, p, props));
+    }
+    return layer.clone(props);
+  }
+  const onTerrainStatic = new Map();   // static layer id -> it, laid on the terrain (made once)
+  function staticOnTerrain(layer) {
+    if (!TerrainExt || TERRAIN_LAYER_IDS.indexOf(layer.id) < 0) return layer;
+    let placed = onTerrainStatic.get(layer.id);
+    if (!placed) { placed = onTerrain(layer); onTerrainStatic.set(layer.id, placed); }
+    return placed;
+  }
+
   function buildLayers() {
     const out = [], overlay = [];
     baseLayers.forEach(function (l) {
       const a = animatedById[l.id];
-      if (!a) { out.push(l); return; }
+      if (!a) { out.push(staticOnTerrain(l)); return; }
       const built = a.animator.build(a.base, a.spec, a.state, currentTime);
       const h = a.spec.meshHeight;
-      const place = (h != null && TerrainExt) ? function (x) { return onMesh(x, h); } : null;
+      const place = (h != null && TerrainExt) ? function (x) { return onMesh(x, h); }
+        : (a.spec.onTerrain && TerrainExt) ? onTerrain : null;
       out.push.apply(out, place ? built.layers.map(place) : built.layers);
       // Markers stand on the drawn surface (a 3D animal right on it), not at the line's height above it.
       overlay.push.apply(overlay, place ? built.overlay.map(onTerrainMarker) : built.overlay);
@@ -1403,6 +1528,13 @@ function createTimeline(deck, props) {
         });
       });
     });
+    if (!(e >= w && n >= s)) {   // no tracks: a map of raster series only, framed on their bounds
+      LAYER_SPECS.forEach(function (spec) {
+        if (spec.kind !== 'raster' || !spec.bounds) return;
+        w = Math.min(w, spec.bounds[0]); s = Math.min(s, spec.bounds[1]);
+        e = Math.max(e, spec.bounds[2]); n = Math.max(n, spec.bounds[3]);
+      });
+    }
     const canvas = deck.getCanvas ? deck.getCanvas() : deck.canvas;
     const width = deck.width || (canvas && canvas.clientWidth), height = deck.height || (canvas && canvas.clientHeight);
     if (!(e >= w && n >= s) || !width || !height) return;
@@ -1659,13 +1791,14 @@ function createTimeline(deck, props) {
     if (needsFilter) {
       ensureDataFilter().then(function (C) { DataFilterCtor = C; __filterReady = true; redraw(); });
     }
-    if (needsMesh) {
+    if (needsMesh || needsDrape || needsOnTerrain) {
       TerrainExt = getTerrainExtension();
       if (TerrainExt) __meshReady = true;
       else {
         loadTerrainExtension().then(
           function (ext) { TerrainExt = ext; __meshReady = true; redraw(); },
-          function () { __meshReady = true; }   // stays at the baked heights
+          // Tracks stay at the baked heights; rasters are drawn flat.
+          function () { terrainExtFailed = true; __meshReady = true; redraw(); }
         );
       }
     }
@@ -1693,8 +1826,8 @@ function createTimeline(deck, props) {
   // Lets a headless driver pause autoplay and paint an exact frame at time t.
   const bridge = {
     get ready()    { return !!animatedById; },
-    // Every lazily loaded piece (3D head model, DataFilterExtension, TerrainExtension) is in place.
-    get headReady() { return __headReady && __filterReady && __meshReady; },
+    // Every lazily loaded piece (3D head model, DataFilterExtension, TerrainExtension, raster frames) is in place.
+    get headReady() { return __headReady && __filterReady && __meshReady && __rasterReady; },
     get span()     { return maxTime; },
     get durationSec() { return durationSec; },
     get specs()    { return LAYER_SPECS; },  // animated layers (id, kind, window), for the exporter's camera
