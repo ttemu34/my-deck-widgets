@@ -645,8 +645,7 @@ export function createCameraPath() {
   }
 
   // ---------------------------------------------------------------------------
-  // Cinematic fly-through: opens on the whole scene, flies in to the action, then follows it
-  // with a tilted camera that turns slowly (or faces the direction of travel)
+  // Follow the action: frames what moved recently, re-fitting smoothly as the subjects move and spread
   // ---------------------------------------------------------------------------
   // Mean motion of the subjects in play around t: their typical speed, and the heading the group
   // drifts (for lead room). Only tracks running at t, and matching `keys`, count.
@@ -664,7 +663,7 @@ export function createCameraPath() {
   }
   // Framing of the recent action, smoothed by a spring, with lead room in the direction the group
   // drifts and the zoom following its pace. bearingFor(motion, progress) gives the heading wanted
-  // (null keeps the last one). Follow the action and Cinematic share it.
+  // (null keeps the last one). Used by Follow the action.
   function actionViews(times, o, base, c, bearingFor) {
     var w = motionWindow(), typ = typicalSpeed(), n = times.length;
     var lead = o.lead_room == null ? 0.1 : o.lead_room, sz = o.speed_zoom == null ? 0.3 : o.speed_zoom;
@@ -687,27 +686,88 @@ export function createCameraPath() {
   }
 
   // ---------------------------------------------------------------------------
-  // Cinematic fly-through: opens on the whole scene, flies in to the action, then follows it
-  // with a tilted camera that turns slowly (or faces the direction of travel)
+  // Cinematic fly-through: a fly-over, after Mapbox's "cinematic route". The camera keeps one
+  // height and tilt for the whole clip (the whole area, or `range` metres), glides over the centre
+  // of the subjects and turns at a steady rate (or faces the way they travel). It opens on the
+  // whole scene and flies in. Unlike the following cameras it never zooms in on the subjects, so
+  // the land they cross stays in view.
   // ---------------------------------------------------------------------------
-  function cinematicPath(times, o, base, c) {
-    var intro = o.intro_frac == null ? 0.12 : o.intro_frac, n = times.length;
-    var mode = o.bearing_mode || 'rotate', turn = o.rotation == null ? 45 : o.rotation;
-    var p0 = (initialView() || {}).pitch || 0;
-    var views = actionViews(times, o, base, c, function (m, prog) {
-      if (mode === 'heading') return m.heading;
-      if (mode === 'fixed') return c.bearing;
-      return c.bearing + turn * prog;
+  // Seconds of video either side of a frame the glide averages over, at follow_smoothing 0.
+  // 'heading' reads the glide's direction over CINE_HEADING_S either side, once it has moved at least
+  // CINE_MOVE_SHARE of the view's height (less is a subject milling about, and the heading is held).
+  var CINE_SMOOTH_S = 4, CINE_HEADING_S = 2, CINE_MOVE_SHARE = 0.003;
+  // Where the subjects are at t: the mean position of every matching track (a track that has not
+  // started or has finished counts where it starts or ends, so the centre never jumps), else the
+  // centre of the matching rows other layers show around t. Null when nothing matches.
+  function groupCentre(t, w, keys) {
+    var S = scene(), sx = 0, sy = 0, sz = 0, m = 0;
+    S.tracks.forEach(function (tr) {
+      if (!matches(tr.d, keys)) return;
+      var p = posAt(tr, t);
+      sx += p[0]; sy += p[1]; sz += p[2] || 0; m++;
     });
-    return views.map(function (vs, i) {
+    if (m) return [sx / m, sy / m, sz / m];
+    var b = recentBox(t, w, keys);
+    if (b.empty) return null;
+    var c = b.center();
+    return [c.lon, c.lat, S.hasZ ? groundZ(c.lon, c.lat) : 0];
+  }
+  function cinematicPath(times, o, base, c) {
+    var n = times.length;
+    if (!n) return [];
+    var fps = o.fps || 30, intro = o.intro_frac == null ? 0.12 : o.intro_frac;
+    var mode = o.bearing_mode || 'rotate', turn = o.rotation == null ? 45 : o.rotation;
+    var p0 = (initialView() || {}).pitch || 0, look = (o.lead_frac || 0) * c.END;
+
+    // The look-at point: the subjects' centre (lead_frac ahead), held where nothing matches yet.
+    var raw = times.map(function (t) { return groupCentre(Math.min(c.END, t + look), c.win, c.keys); });
+    var first = raw.find(function (p) { return p; }) || [base.longitude, base.latitude, 0], last = first;
+    raw = raw.map(function (p) { last = p || last; return last; });
+    var lat0 = first[1], lon0 = first[0], kx = M_PER_DEG * Math.cos(lat0 * Math.PI / 180);
+    var X = raw.map(function (p) { return (p[0] - lon0) * kx; });
+    var Y = raw.map(function (p) { return (p[1] - lat0) * M_PER_DEG; });
+    var Z = raw.map(function (p) { return p[2] || 0; });
+    // Glide: averaged twice over the window (a triangle-weighted mean), so the camera eases over the
+    // subjects' zigzags and changes of pace without trailing them.
+    var k = windowFrames(o.follow_smoothing == null ? 0.25 : o.follow_smoothing, CINE_SMOOTH_S, fps);
+    var sx = centredMean(centredMean(X, k), k), sy = centredMean(centredMean(Y, k), k);
+    var sz = centredMean(centredMean(Z, k), k);
+
+    // Height: one zoom for the whole clip.
+    var zoom = o.range != null ? zoomForRange(o.range, lat0, o.height, o.fov) : base.zoom;
+
+    // Heading for 'heading': the way the glide goes, held while it rests, smoothed like the glide.
+    var brg = null;
+    if (mode === 'heading') {
+      var kh = Math.max(1, Math.round(CINE_HEADING_S * fps));
+      var minMove = CINE_MOVE_SHARE * viewGroundM(zoom, lat0, o, c.pitch), held = null;
+      brg = sx.map(function (_, i) {
+        var a = Math.max(0, i - kh), b = Math.min(n - 1, i + kh);
+        var dx = sx[b] - sx[a], dy = sy[b] - sy[a];
+        if (Math.hypot(dx, dy) >= minMove) held = Math.atan2(dx, dy) * 180 / Math.PI;
+        return held;
+      });
+      var h0 = brg.find(function (v) { return v != null; });
+      if (h0 == null) h0 = c.bearing;
+      for (var f = 0; f < n && brg[f] == null; f++) brg[f] = h0;
+      for (var u = 1; u < n; u++) brg[u] = brg[u - 1] + shortestAngle(brg[u - 1], brg[u]);   // unwrapped
+      brg = centredMean(centredMean(brg, k), k);
+    }
+
+    return times.map(function (t, i) {
       var prog = n > 1 ? i / (n - 1) : 1;
-      if (!(intro > 0 && prog < intro)) return vs;
+      var bearing = mode === 'heading' ? brg[i] : mode === 'fixed' ? c.bearing : c.bearing + turn * prog;
+      bearing = ((bearing % 360) + 360) % 360;
+      var v = { longitude: lon0 + sx[i] / kx, latitude: lat0 + sy[i] / M_PER_DEG, zoom: zoom,
+                pitch: c.pitch, bearing: bearing, position: [0, 0, sz[i]] };
+      if (!(intro > 0 && prog < intro)) return v;
       var e = ease(prog / intro);                          // fly in from the whole-scene view
-      return { longitude: base.longitude + (vs.longitude - base.longitude) * e,
-               latitude: base.latitude + (vs.latitude - base.latitude) * e,
-               zoom: base.zoom + (vs.zoom - base.zoom) * e,
+      return { longitude: base.longitude + (v.longitude - base.longitude) * e,
+               latitude: base.latitude + (v.latitude - base.latitude) * e,
+               zoom: base.zoom + (v.zoom - base.zoom) * e,
                pitch: p0 + (c.pitch - p0) * e,             // ...tilting from the map's angle
-               bearing: vs.bearing };
+               bearing: c.bearing + shortestAngle(c.bearing, bearing) * e,
+               position: v.position };
     });
   }
 

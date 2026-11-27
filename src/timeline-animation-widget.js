@@ -1294,6 +1294,8 @@ function createTimeline(deck, props) {
   }
 
   function updateControls() {
+    // The data's date and time: a clock in a corner of the map (ClockWidget), not on the bar.
+    if (CONTROLS.show_time && window.__mapClock) window.__mapClock.setText(formatTime(currentTime));
     if (!controls) return;
     if (controls.play) {
       const playing = isPlaying && !pausing;
@@ -1301,7 +1303,7 @@ function createTimeline(deck, props) {
       controls.play.title = playing ? 'Pause' : 'Play';
     }
     if (controls.slider && document.activeElement !== controls.slider) controls.slider.value = currentTime;
-    if (controls.label) {
+    if (controls.label) {   // the data time on the bar: pages drawn before the map clock only
       controls.label.textContent = loadingMap && !autoplayOff ? 'Loading map…' : formatTime(currentTime);
     }
     if (controls.clock) {   // playback position / total length, at the current speed
@@ -1355,7 +1357,9 @@ function createTimeline(deck, props) {
       c.clock = text('Playback position / total length at this speed');
       c.clock.style.opacity = '0.75';
     }
-    if (CONTROLS.show_time) c.label = text('Current time in the data');
+    // The data time is the map clock's (ClockWidget, placed by time_position); pages drawn before it
+    // existed have no time_position and keep it on the bar.
+    if (CONTROLS.show_time && !CONTROLS.time_position) c.label = text('Current time in the data');
     if (CONTROLS.show_camera) {
       button('🎥', 'Camera: design and preview the video camera', function () {
         if (window.__camPanel) window.__camPanel.toggle();
