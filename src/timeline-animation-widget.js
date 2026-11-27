@@ -223,6 +223,25 @@ function createTimeline(deck, props) {
     }
   }
 
+  // deck's ScenegraphLayer asks for another frame after every draw while it has `_animations`, even with
+  // every clip stopped, so a map with animated 3D markers redrew ~60 times a second while paused, and every
+  // page of the video exporter did so all the time (renderAt draws the frames it needs itself). That kept the
+  // GPU busy for nothing: the computer turned sluggish while a video was made, and with several capture pages
+  // a new page could not load its map or 3D model, so the video stopped (MapTilesNotLoaded). The markers now
+  // ask for frames only while the map is playing; a pause or seek redraws through redraw() as before.
+  function quietScenegraph(C) {
+    if (!C) return C;
+    class QuietScenegraphLayer extends C {
+      draw(opts) {
+        super.draw(opts);
+        if ((headless || !isPlaying) && this.internalState) this.internalState.needsRedraw = false;
+      }
+    }
+    QuietScenegraphLayer.layerName = C.layerName;
+    QuietScenegraphLayer.defaultProps = C.defaultProps;
+    return QuietScenegraphLayer;
+  }
+
   async function ensureDataFilter() {
     const found = resolveLayer('DataFilterExtension');
     if (found) return found;
@@ -1790,7 +1809,7 @@ function createTimeline(deck, props) {
       }
     }
     if (needsModel) {
-      ensureScenegraph().then(function (C) { ScenegraphCtor = C; __headReady = true; redraw(); });
+      ensureScenegraph().then(function (C) { ScenegraphCtor = quietScenegraph(C); __headReady = true; redraw(); });
     }
     if (needsFilter) {
       ensureDataFilter().then(function (C) { DataFilterCtor = C; __filterReady = true; redraw(); });
